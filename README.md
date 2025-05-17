@@ -4,8 +4,8 @@ Key-Value Store solution for PhysicsX.
 
 # example
 
-# Single write with TTL (60s)
-# curl -X PUT "http://localhost:8000/kv/foo?ttl=60" -d "bar"
+Single write with TTL (60s)
+curl -X PUT "http://localhost:8000/kv/foo?ttl=60" -d "bar"
 
 # Read
 # curl http://localhost:8000/kv/foo
