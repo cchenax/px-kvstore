@@ -3,6 +3,7 @@
 
 import json
 import os
+import random
 import threading
 import time
 from typing import Any
@@ -46,6 +47,7 @@ class SnapshotManager(object):
         self._interval = float(interval_seconds)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="pxkv-snapshot", daemon=True)
+        self._fail_p = float(os.getenv("PXKV_FAULT_SNAPSHOT_FAIL_P", "0") or "0")
 
     def start(self) -> None:
         if self._interval <= 0:
@@ -57,6 +59,8 @@ class SnapshotManager(object):
         self._thread.join(timeout=5)
 
     def snapshot_once(self) -> None:
+        if self._fail_p > 0 and random.random() < self._fail_p:
+            raise RuntimeError("fault injection: snapshot failure")
         data = self._store.dump()
         tmp_path = f"{self._path}.tmp"
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
