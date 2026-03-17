@@ -13,20 +13,6 @@ An in-memory, sharded, LRU key-value store with TTL, HTTP API, basic metrics, an
 - **AI cache observability**: `/admin/metrics` exposes `ai_cache` counters (lookups/hits/misses/stores) so you can track hit rate and cost savings.
 - **AI cache + TTL + snapshots**: cached responses can have TTL and (optionally) survive restarts via “remaining TTL snapshots”, enabling reproducible experiments and warm-start behavior.
 
-## Architecture (high-level)
-
-```mermaid
-flowchart LR
-  C[Client] -->|HTTP| S[KVHandler]
-  S -->|route by crc32(key)%N| SH[ShardedKeyValueStore]
-  SH --> A[Shard 0: LRU+TTL+Lock]
-  SH --> B[Shard 1: LRU+TTL+Lock]
-  SH --> D[Shard N-1: LRU+TTL+Lock]
-  S --> M[In-process metrics]
-  SM[SnapshotManager] -->|periodic/manual| F[(JSON snapshot file)]
-  SM --> SH
-```
-
 ## Semantics (important details)
 
 - **Value encoding**:
