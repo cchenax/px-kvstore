@@ -1,0 +1,65 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import time
+from typing import Any, Dict
+
+_LATENCY_BUCKETS_MS = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+
+class MetricsRegistry:
+    def __init__(self):
+        self._metrics: Dict[str, Any] = {
+            "started_at": time.time(),
+            "requests_total": 0,
+            "requests_by_method": {},
+            "errors_total": 0,
+            "latency_ms": {
+                "buckets_ms": _LATENCY_BUCKETS_MS,
+                "by_route": {},
+            },
+            "ai_cache": {
+                "lookups": 0,
+                "hits": 0,
+                "misses": 0,
+                "stores": 0,
+            },
+        }
+
+    def inc_requests(self, method: str, error: bool = False):
+        self._metrics["requests_total"] += 1
+        by_method = self._metrics.setdefault("requests_by_method", {})
+        by_method[method] = by_method.get(method, 0) + 1
+        if error:
+            self._metrics["errors_total"] += 1
+
+    def observe_latency(self, route: str, elapsed_ms: float):
+        if elapsed_ms < 0:
+            elapsed_ms = 0.0
+        bucket = "inf"
+        for b in _LATENCY_BUCKETS_MS:
+            if elapsed_ms <= b:
+                bucket = str(b)
+                break
+        latency = self._metrics.setdefault("latency_ms", {"buckets_ms": _LATENCY_BUCKETS_MS, "by_route": {}})
+        by_route = latency.setdefault("by_route", {})
+        r = by_route.setdefault(
+            route,
+            {
+                "count": 0,
+                "sum_ms": 0.0,
+                "buckets": {},
+            },
+        )
+        r["count"] += 1
+        r["sum_ms"] += float(elapsed_ms)
+        buckets = r.setdefault("buckets", {})
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    def inc_ai_cache(self, metric: str):
+        if metric in self._metrics["ai_cache"]:
+            self._metrics["ai_cache"][metric] += 1
+
+    def get_all(self) -> Dict[str, Any]:
+        return self._metrics
+
+registry = MetricsRegistry()

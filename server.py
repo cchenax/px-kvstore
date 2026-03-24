@@ -4,10 +4,10 @@
 """
 Backward-compatible entry point to run the PX KV HTTP server.
 
-Prefer importing and using `pxkv.http.run` directly.
+Prefer importing and using `pxkv.api.server.run` directly.
 """
 
-from pxkv.http import run
+from pxkv.api.server import run
 
 
 if __name__ == "__main__":

@@ -13,64 +13,43 @@ import uuid
 import random
 from typing import Any, Dict, Tuple
 
-from .store import ShardedKeyValueStore
-from .persistence import SnapshotManager, load_snapshot
-from .ai import compute_ai_cache_key
+from ..core.sharded import ShardedKeyValueStore
+from ..persistence.snapshot import SnapshotManager, load_snapshot
+from ..persistence.wal import recover_from_wal
+from ..cache.ai import ai_cache_manager
+from ..metrics.registry import registry
+from ..core.expiration import BackgroundExpirer
+from ..config.settings import settings
 
+STORE = ShardedKeyValueStore(
+    shards=settings.SHARDS,
+    per_shard_max=settings.PER_SHARD_MAX,
+    eviction_policy=settings.EVICTION_POLICY,
+    wal_path=settings.WAL_FILE
+)
 
-HOST = os.getenv("PXKV_HOST", "0.0.0.0")
-PORT = int(os.getenv("PXKV_PORT", "8000"))
-SHARDS = int(os.getenv("PXKV_SHARD_COUNT", os.getenv("SHARD_COUNT", "4")))
-PER_SHARD_MAX = int(os.getenv("PXKV_PER_SHARD_MAX", "1000"))
-EVICTION_POLICY = os.getenv("PXKV_EVICTION_POLICY", "lru")
+_EXPIRER = BackgroundExpirer(STORE, interval=60.0)
+_EXPIRER.start()
 
-FAULT_LATENCY_MS = float(os.getenv("PXKV_FAULT_LATENCY_MS", "0") or "0")
-FAULT_LATENCY_JITTER_MS = float(os.getenv("PXKV_FAULT_LATENCY_JITTER_MS", "0") or "0")
+if settings.SNAPSHOT_FILE:
+    load_snapshot(STORE, settings.SNAPSHOT_FILE)
 
-STORE = ShardedKeyValueStore(shards=SHARDS, per_shard_max=PER_SHARD_MAX, eviction_policy=EVICTION_POLICY)
-
-SNAPSHOT_FILE = os.getenv("PXKV_SNAPSHOT_FILE", "")
-SNAPSHOT_INTERVAL = float(os.getenv("PXKV_SNAPSHOT_INTERVAL", "0"))
-
-if SNAPSHOT_FILE:
-    load_snapshot(STORE, SNAPSHOT_FILE)
+if settings.WAL_FILE:
+    recover_from_wal(STORE, settings.WAL_FILE)
 
 _SNAPSHOT_MANAGER: SnapshotManager | None = None
-if SNAPSHOT_FILE and SNAPSHOT_INTERVAL > 0:
-    _SNAPSHOT_MANAGER = SnapshotManager(STORE, SNAPSHOT_FILE, SNAPSHOT_INTERVAL)
+if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
+    _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
     _SNAPSHOT_MANAGER.start()
-
-_LATENCY_BUCKETS_MS = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
-
-_METRICS: Dict[str, Any] = {
-    "started_at": time.time(),
-    "requests_total": 0,
-    "requests_by_method": {},
-    "errors_total": 0,
-    "latency_ms": {
-        "buckets_ms": _LATENCY_BUCKETS_MS,
-        "by_route": {},
-    },
-    "ai_cache": {
-        "lookups": 0,
-        "hits": 0,
-        "misses": 0,
-        "stores": 0,
-    },
-}
-
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
 
 class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     server_version = "PX-KVStore/2.0"
 
     def _fault_sleep(self) -> None:
-        if FAULT_LATENCY_MS <= 0 and FAULT_LATENCY_JITTER_MS <= 0:
+        if settings.FAULT_LATENCY_MS <= 0 and settings.FAULT_LATENCY_JITTER_MS <= 0:
             return
-        base = max(0.0, FAULT_LATENCY_MS)
-        jitter = max(0.0, FAULT_LATENCY_JITTER_MS)
+        base = max(0.0, settings.FAULT_LATENCY_MS)
+        jitter = max(0.0, settings.FAULT_LATENCY_JITTER_MS)
         extra = random.random() * jitter if jitter > 0 else 0.0
         time.sleep((base + extra) / 1000.0)
 
@@ -113,39 +92,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         payload = json.dumps(obj, default=_default, ensure_ascii=False)
         self._send(code, payload.encode("utf-8"), "application/json")
 
-    def _observe_latency(self, route: str, elapsed_ms: float) -> None:
-        if elapsed_ms < 0:
-            elapsed_ms = 0.0
-        bucket = "inf"
-        for b in _LATENCY_BUCKETS_MS:
-            if elapsed_ms <= b:
-                bucket = str(b)
-                break
-        latency = _METRICS.setdefault("latency_ms", {"buckets_ms": _LATENCY_BUCKETS_MS, "by_route": {}})
-        by_route = latency.setdefault("by_route", {})
-        r = by_route.setdefault(
-            route,
-            {
-                "count": 0,
-                "sum_ms": 0.0,
-                "buckets": {},
-            },
-        )
-        r["count"] += 1
-        r["sum_ms"] += float(elapsed_ms)
-        buckets = r.setdefault("buckets", {})
-        buckets[bucket] = buckets.get(bucket, 0) + 1
-
     def _inc_metrics(self, method: str, route: str = "", error: bool = False) -> None:
-        _METRICS["requests_total"] += 1
-        by_method = _METRICS.setdefault("requests_by_method", {})
-        by_method[method] = by_method.get(method, 0) + 1
-        if error:
-            _METRICS["errors_total"] += 1
+        registry.inc_requests(method, error)
         if route:
             self._ensure_request_context()
             elapsed_ms = (time.time() - self._request_started_at) * 1000.0
-            self._observe_latency(route, elapsed_ms)
+            registry.observe_latency(route, elapsed_ms)
 
     # Core KV APIs
     def do_GET(self) -> None:
@@ -164,7 +116,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if parts[0] == "ai":
                 if len(parts) >= 2 and parts[1] == "cache":
-                    # GET /ai/cache/<key>
                     if len(parts) != 3 or not parts[2]:
                         raise ValueError
                     cache_key = parts[2]
@@ -217,7 +168,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /kv/:key")
         except KeyError as e:
             self._send(404, str(e))
-            # Best-effort: keep route labels stable for metrics even on miss.
             if self.path.startswith("/ai/cache/"):
                 self._inc_metrics("GET", route="GET /ai/cache/:key", error=True)
             else:
@@ -286,35 +236,37 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
                     model = payload.get("model", "")
+                    model_version = payload.get("model_version")
                     params = payload.get("params", {}) or {}
                     if not isinstance(prompt, str) or not isinstance(model, str) or not isinstance(params, dict):
                         self._send(400, "prompt/model must be string; params must be object")
                         self._inc_metrics("POST", route="POST /ai/cache/lookup", error=True)
                         return
-                    key, canon = compute_ai_cache_key(prompt=prompt, model=model, params=params)
+                    key, canon = ai_cache_manager.compute_key(prompt, model, params, model_version=model_version)
                     storage_key = f"ai:cache:{key}"
-                    _METRICS["ai_cache"]["lookups"] += 1
+                    registry.inc_ai_cache("lookups")
                     try:
                         cached = STORE.read(storage_key)
+                        cached = ai_cache_manager.decompress_value(cached)
                     except KeyError:
-                        _METRICS["ai_cache"]["misses"] += 1
+                        registry.inc_ai_cache("misses")
                         self._json(200, {"hit": False, "key": key, "canonical": canon})
                         self._inc_metrics("POST", route="POST /ai/cache/lookup")
                         return
-                    _METRICS["ai_cache"]["hits"] += 1
+                    registry.inc_ai_cache("hits")
                     self._json(200, {"hit": True, "key": key, "canonical": canon, "value": cached})
                     self._inc_metrics("POST", route="POST /ai/cache/lookup")
                     return
 
                 if parts == ["ai", "cache"]:
-                    # POST /ai/cache
-                    # Body: {prompt, model, params, value, ttl?}
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
                     model = payload.get("model", "")
+                    model_version = payload.get("model_version")
                     params = payload.get("params", {}) or {}
                     value = payload.get("value")
                     ttl = payload.get("ttl")
+                    compress = payload.get("compress", False)
                     if not isinstance(prompt, str) or not isinstance(model, str) or not isinstance(params, dict):
                         self._send(400, "prompt/model must be string; params must be object")
                         self._inc_metrics("POST", route="POST /ai/cache", error=True)
@@ -327,14 +279,15 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                             self._send(400, "ttl must be numeric")
                             self._inc_metrics("POST", route="POST /ai/cache", error=True)
                             return
-                    key, canon = compute_ai_cache_key(prompt=prompt, model=model, params=params)
+                    key, canon = ai_cache_manager.compute_key(prompt, model, params, model_version=model_version)
                     storage_key = f"ai:cache:{key}"
-                    # Upsert semantics for cache store.
+                    if compress:
+                        value = ai_cache_manager.compress_value(value)
                     if storage_key in STORE.mget([storage_key]):
                         STORE.update(storage_key, value, ttl_f)
                     else:
                         STORE.create(storage_key, value, ttl_f)
-                    _METRICS["ai_cache"]["stores"] += 1
+                    registry.inc_ai_cache("stores")
                     self._json(201, {"key": key, "canonical": canon})
                     self._inc_metrics("POST", route="POST /ai/cache")
                     return
@@ -343,7 +296,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 key = parts[2]
                 delta = 1.0
                 ttl = None
-                # Parse query parameters for delta and ttl if provided
                 _, query = self._parse()
                 if "delta" in query:
                     try:
@@ -390,7 +342,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     # Admin & metrics APIs
     def _handle_admin_get(self, parts: list[str], query: Dict[str, list[str]]) -> None:
         if not parts:
-            self._json(200, {"status": "ok", "shards": SHARDS})
+            self._json(200, {"status": "ok", "shards": settings.SHARDS})
             self._inc_metrics("GET", route="GET /admin")
             return
         if parts[0] == "health":
@@ -398,24 +350,24 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 200,
                 {
                     "status": "ok",
-                    "uptime_seconds": time.time() - _METRICS["started_at"],
-                    "shards": SHARDS,
+                    "uptime_seconds": time.time() - registry.get_all()["started_at"],
+                    "shards": settings.SHARDS,
                 },
             )
             self._inc_metrics("GET", route="GET /admin/health")
             return
         if parts[0] == "metrics":
-            self._json(200, _METRICS)
+            self._json(200, registry.get_all())
             self._inc_metrics("GET", route="GET /admin/metrics")
             return
         if parts[0] == "snapshot":
-            if _SNAPSHOT_MANAGER is None or not SNAPSHOT_FILE:
+            if _SNAPSHOT_MANAGER is None or not settings.SNAPSHOT_FILE:
                 self._send(400, "snapshotting is disabled")
                 self._inc_metrics("GET", route="GET /admin/snapshot", error=True)
                 return
             try:
                 _SNAPSHOT_MANAGER.snapshot_once()
-                self._json(200, {"status": "ok", "path": SNAPSHOT_FILE})
+                self._json(200, {"status": "ok", "path": settings.SNAPSHOT_FILE})
                 self._inc_metrics("GET", route="GET /admin/snapshot")
             except Exception as e:
                 self._send(500, f"snapshot failed: {e}")
@@ -430,13 +382,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
 
 def run() -> None:
-    httpd = BaseHTTPServer.HTTPServer((HOST, PORT), KVHandler)
+    httpd = BaseHTTPServer.HTTPServer((settings.HOST, settings.PORT), KVHandler)
     logging.info(
         "Serving on http://%s:%d  shards=%d per_shard_max=%d",
-        HOST,
-        PORT,
-        SHARDS,
-        PER_SHARD_MAX,
+        settings.HOST,
+        settings.PORT,
+        settings.SHARDS,
+        settings.PER_SHARD_MAX,
     )
 
     def stop(sig: int, _frame: Any) -> None:
@@ -448,7 +400,5 @@ def run() -> None:
     signal.signal(signal.SIGTERM, stop)
     httpd.serve_forever()
 
-
 if __name__ == "__main__":
     run()
-
