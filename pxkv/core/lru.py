@@ -167,7 +167,10 @@ class LRUKeyValueStore(object):
             else:
                 current = node.value
                 if not isinstance(current, (int, float)):
-                    raise TypeError("INCR target must be numeric")
+                    try:
+                        current = float(current)
+                    except (ValueError, TypeError):
+                        raise TypeError("INCR target must be numeric")
             new_val = float(current) + float(delta)
             node.value = new_val
             self._move_to_tail(node)

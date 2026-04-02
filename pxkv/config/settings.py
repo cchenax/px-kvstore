@@ -17,4 +17,8 @@ class Settings:
     SNAPSHOT_INTERVAL = float(os.getenv("PXKV_SNAPSHOT_INTERVAL", "0"))
     WAL_FILE = os.getenv("PXKV_WAL_FILE", "")
 
+    REDIS_HOST = os.getenv("PXKV_REDIS_HOST", "0.0.0.0")
+    REDIS_PORT = int(os.getenv("PXKV_REDIS_PORT", "6379"))
+    REDIS_ENABLED = os.getenv("PXKV_REDIS_ENABLED", "true").lower() == "true"
+
 settings = Settings()

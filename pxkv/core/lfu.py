@@ -135,7 +135,10 @@ class LFUKeyValueStore(object):
             else:
                 current = self._map[key]
                 if not isinstance(current, (int, float)):
-                    raise TypeError("INCR target must be numeric")
+                    try:
+                        current = float(current)
+                    except (ValueError, TypeError):
+                        raise TypeError("INCR target must be numeric")
             new_val = float(current) + float(delta)
             self._map[key] = new_val
             self._skeys.add(key)

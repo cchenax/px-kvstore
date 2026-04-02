@@ -83,6 +83,14 @@ export PXKV_SNAPSHOT_INTERVAL=60
 python server.py
 ```
 
+### **Redis Protocol Support**
+You can connect to PX-KVStore using any standard Redis client:
+```bash
+redis-cli -p 6379 SET mykey "Hello Redis"
+redis-cli -p 6379 GET mykey
+```
+Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`.
+
 ---
 
 ## **Roadmap**
@@ -90,7 +98,7 @@ python server.py
 - [x] **WAL + Crash Recovery**: Persistent transaction logging.
 - [x] **Consistent Hashing**: Scalable sharding with virtual nodes.
 - [x] **Background Expiration**: Proactive memory reclamation.
-- [ ] **Redis Protocol Compatibility**: Use `redis-py` or `redis-cli` directly.
+- [x] **Redis Protocol Compatibility**: Use `redis-py` or `redis-cli` directly on port 6379.
 - [ ] **Asynchronous Replication**: Leader-Follower setup for high availability.
 - [ ] **Pluggable Storage Backends**: Support for disk-backed shards (e.g., RocksDB).
 - [ ] **Semantic Cache Key Hooks**: Custom prompt normalization and versioning logic.

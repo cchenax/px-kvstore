@@ -20,6 +20,7 @@ from ..cache.ai import ai_cache_manager
 from ..metrics.registry import registry
 from ..core.expiration import BackgroundExpirer
 from ..config.settings import settings
+from ..api.redis_server import RedisServer
 
 STORE = ShardedKeyValueStore(
     shards=settings.SHARDS,
@@ -36,6 +37,11 @@ if settings.SNAPSHOT_FILE:
 
 if settings.WAL_FILE:
     recover_from_wal(STORE, settings.WAL_FILE)
+
+_REDIS_SERVER: RedisServer | None = None
+if settings.REDIS_ENABLED:
+    _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
+    _REDIS_SERVER.start()
 
 _SNAPSHOT_MANAGER: SnapshotManager | None = None
 if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:

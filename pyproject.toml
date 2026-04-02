@@ -12,6 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "redis",
 ]
 
 [build-system]
