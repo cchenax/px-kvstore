@@ -21,4 +21,9 @@ class Settings:
     REDIS_PORT = int(os.getenv("PXKV_REDIS_PORT", "6379"))
     REDIS_ENABLED = os.getenv("PXKV_REDIS_ENABLED", "true").lower() == "true"
 
+    REPLICATION_ROLE = os.getenv("PXKV_REPLICATION_ROLE", "leader").lower() # leader or follower
+    REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
+    REPLICATION_FOLLOWERS = os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") # For leader
+    REPLICATION_SYNC_INTERVAL = float(os.getenv("PXKV_REPLICATION_SYNC_INTERVAL", "1.0"))
+
 settings = Settings()

@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from ..persistence.wal import WAL
+from ..persistence.replication import ReplicationManager
 
 class ShardedKeyValueStore(object):
     """
@@ -41,6 +42,7 @@ class ShardedKeyValueStore(object):
         self._ring.sort()
         
         self._wal = WAL(wal_path)
+        self._replication = ReplicationManager(self)
 
     def _idx(self, key: Any) -> int:
         if isinstance(key, str):
@@ -63,6 +65,7 @@ class ShardedKeyValueStore(object):
     def create(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         self._bucket(key).create(key, value, ttl)
         self._wal.log("create", key, value, ttl)
+        self._replication.enqueue_change("create", key, value, ttl)
 
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
@@ -70,10 +73,12 @@ class ShardedKeyValueStore(object):
     def update(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         self._bucket(key).update(key, value, ttl)
         self._wal.log("update", key, value, ttl)
+        self._replication.enqueue_change("update", key, value, ttl)
 
     def delete(self, key: Any) -> None:
         self._bucket(key).delete(key)
         self._wal.log("delete", key)
+        self._replication.enqueue_change("delete", key)
 
     def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None) -> None:
         grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
@@ -82,6 +87,7 @@ class ShardedKeyValueStore(object):
         for idx, sub in grouped.items():
             self._shards[idx].mset(sub, ttl)
         self._wal.log("mset", items, ttl=ttl)
+        self._replication.enqueue_change("mset", items, ttl=ttl)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
@@ -95,6 +101,7 @@ class ShardedKeyValueStore(object):
     def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None) -> float:
         val = self._bucket(key).incr(key, delta, ttl)
         self._wal.log("incr", key, delta, ttl)
+        self._replication.enqueue_change("incr", key, delta, ttl)
         return val
 
     def keys(self) -> List[Any]:

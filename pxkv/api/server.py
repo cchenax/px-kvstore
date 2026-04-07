@@ -38,6 +38,9 @@ if settings.SNAPSHOT_FILE:
 if settings.WAL_FILE:
     recover_from_wal(STORE, settings.WAL_FILE)
 
+# Start replication after recovery
+STORE._replication.start()
+
 _REDIS_SERVER: RedisServer | None = None
 if settings.REDIS_ENABLED:
     _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -237,6 +240,19 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._fault_sleep()
         try:
             parts, _ = self._parse()
+            
+            # Replication Sync (Follower only)
+            if parts == ["replication", "sync"]:
+                if settings.REPLICATION_ROLE != "follower":
+                    self._send(403, "Only followers can receive sync")
+                    return
+                payload = json.loads(self._body() or b"{}")
+                changes = payload.get("changes", [])
+                STORE._replication.apply_changes(changes)
+                self._json(200, {"status": "ok", "applied": len(changes)})
+                self._inc_metrics("POST", route="POST /replication/sync")
+                return
+
             if len(parts) >= 1 and parts[0] == "ai":
                 if parts == ["ai", "cache", "lookup"]:
                     payload = json.loads(self._body() or b"{}")
@@ -348,9 +364,10 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     # Admin & metrics APIs
     def _handle_admin_get(self, parts: list[str], query: Dict[str, list[str]]) -> None:
         if not parts:
-            self._json(200, {"status": "ok", "shards": settings.SHARDS})
+            self._json(200, {"status": "ok", "shards": settings.SHARDS, "role": settings.REPLICATION_ROLE})
             self._inc_metrics("GET", route="GET /admin")
             return
+        # ... existing logic ...
         if parts[0] == "health":
             self._json(
                 200,
