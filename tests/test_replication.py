@@ -72,3 +72,40 @@ def test_replication_incr(leader_follower_cluster):
     resp = requests.get(follower_url)
     assert resp.status_code == 200
     assert resp.json()["value"] == 2.0
+
+def test_replication_full_sync():
+    # Test that a new follower pulls existing data from leader
+    leader_port = "19000"
+    follower_port = "19001"
+    
+    leader_env = os.environ.copy()
+    leader_env["PXKV_PORT"] = leader_port
+    leader_env["PXKV_REPLICATION_ROLE"] = "leader"
+    leader_env["PXKV_REDIS_ENABLED"] = "false"
+    
+    # 1. Start Leader and write data
+    leader_proc = subprocess.Popen(["python3", "server.py"], env=leader_env)
+    time.sleep(2.0)
+    requests.put(f"http://localhost:{leader_port}/kv/pre_existing", data=b"pre_value")
+    
+    # 2. Start Follower
+    follower_env = os.environ.copy()
+    follower_env["PXKV_PORT"] = follower_port
+    follower_env["PXKV_REPLICATION_ROLE"] = "follower"
+    follower_env["PXKV_REPLICATION_LEADER_ADDR"] = f"localhost:{leader_port}"
+    follower_env["PXKV_REDIS_ENABLED"] = "false"
+    
+    follower_proc = subprocess.Popen(["python3", "server.py"], env=follower_env)
+    time.sleep(3.0) # Wait for full sync
+    
+    # 3. Check Follower has the data
+    resp = requests.get(f"http://localhost:{follower_port}/kv/pre_existing")
+    
+    # Cleanup
+    leader_proc.terminate()
+    follower_proc.terminate()
+    leader_proc.wait()
+    follower_proc.wait()
+    
+    assert resp.status_code == 200
+    assert resp.json()["value"] == "pre_value"

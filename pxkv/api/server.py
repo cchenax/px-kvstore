@@ -18,6 +18,7 @@ from ..persistence.snapshot import SnapshotManager, load_snapshot
 from ..persistence.wal import recover_from_wal
 from ..cache.ai import ai_cache_manager
 from ..metrics.registry import registry
+from ..metrics.prometheus import registry_to_prometheus
 from ..core.expiration import BackgroundExpirer
 from ..config.settings import settings
 from ..api.redis_server import RedisServer
@@ -117,6 +118,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             parts, query = self._parse()
             if not parts:
                 self._json(200, {"status": "ok"})
+                return
+
+            # Replication Snapshot (Leader only)
+            if parts == ["replication", "snapshot"]:
+                if settings.REPLICATION_ROLE != "leader":
+                    self._send(403, "Only leader can provide snapshot")
+                    return
+                # Return full dump
+                self._json(200, STORE.dump())
+                self._inc_metrics("GET", route="GET /replication/snapshot")
                 return
 
             if parts[0] == "admin":
@@ -380,7 +391,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /admin/health")
             return
         if parts[0] == "metrics":
-            self._json(200, registry.get_all())
+            fmt = query.get("format", ["json"])[0]
+            if fmt == "prometheus":
+                prom_data = registry_to_prometheus(registry.get_all())
+                self._send(200, prom_data, "text/plain; version=0.0.4; charset=utf-8")
+            else:
+                self._json(200, registry.get_all())
             self._inc_metrics("GET", route="GET /admin/metrics")
             return
         if parts[0] == "snapshot":

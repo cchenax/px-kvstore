@@ -6,7 +6,9 @@ from .core.lru import LRUKeyValueStore
 from .core.lfu import LFUKeyValueStore
 from .cache.ai import compute_ai_cache_key
 from .persistence.snapshot import SnapshotManager, load_snapshot
+from .persistence.replication import ReplicationManager
 from .metrics.registry import registry
+from .metrics.prometheus import registry_to_prometheus
 from .config.settings import settings
 
 __all__ = [
@@ -16,6 +18,8 @@ __all__ = [
     "compute_ai_cache_key",
     "SnapshotManager",
     "load_snapshot",
+    "ReplicationManager",
     "registry",
+    "registry_to_prometheus",
     "settings",
 ]

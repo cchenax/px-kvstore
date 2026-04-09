@@ -35,7 +35,24 @@ class ReplicationManager:
                 threading.Thread(target=self._leader_replication_loop, daemon=True).start()
         else:
             logging.info("Starting replication as FOLLOWER. Leader: %s", self.leader_addr)
+            # Initial Full Sync
+            self._initial_full_sync()
             threading.Thread(target=self._follower_replication_loop, daemon=True).start()
+
+    def _initial_full_sync(self):
+        """Follower pulls full snapshot from leader on startup"""
+        logging.info("Performing initial full sync from leader: %s", self.leader_addr)
+        try:
+            url = f"http://{self.leader_addr}/replication/snapshot"
+            resp = requests.get(url, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                self.store.load(data)
+                logging.info("Initial full sync completed successfully")
+            else:
+                logging.error("Failed to pull snapshot from leader: %s", resp.text)
+        except Exception as e:
+            logging.error("Initial full sync failed: %s", e)
 
     def stop(self):
         self._stop_event.set()
