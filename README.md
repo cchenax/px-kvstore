@@ -4,6 +4,17 @@
 
 PX-KVStore is a sharded, in-memory key-value store designed for low-latency workloads, with a specific focus on AI engineering and reproducibility. It bridges the gap between simple "scripts" and heavy production databases by providing a layered, observable, and extensible architecture.
 
+### **Replication Lifecycle**
+PX-KVStore supports asynchronous Leader-Follower replication:
+1. **Initial Full Sync**: Follower pulls the full state (Snapshot) from the Leader on startup.
+2. **Incremental Sync**: Leader pushes real-time changes to all registered Followers via a background queue.
+3. **Fault Tolerance**: Replication is non-blocking on the Leader, ensuring high write availability.
+
+### **Observability**
+- **JSON API**: Detailed metrics at `/admin/metrics`.
+- **Prometheus**: Native exposition format at `/admin/metrics?format=prometheus`.
+- **Latency Tracking**: Per-route latency histograms and counters.
+
 ---
 
 ## **Architecture**
@@ -99,9 +110,9 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Consistent Hashing**: Scalable sharding with virtual nodes.
 - [x] **Background Expiration**: Proactive memory reclamation.
 - [x] **Redis Protocol Compatibility**: Use `redis-py` or `redis-cli` directly on port 6379.
-- [ ] **Asynchronous Replication**: Leader-Follower setup for high availability.
-- [ ] **Pluggable Storage Backends**: Support for disk-backed shards (e.g., RocksDB).
-- [ ] **Semantic Cache Key Hooks**: Custom prompt normalization and versioning logic.
+- [x] **Asynchronous Replication**: Leader-Follower setup with full sync and incremental sync.
+- [x] **Prometheus Metrics**: Export metrics in Prometheus format for integration with Grafana.
+- [ ] **Config hot reload**: Dynamic configuration updates.
 
 ---
 

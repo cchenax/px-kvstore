@@ -62,32 +62,44 @@ class ShardedKeyValueStore(object):
         for shard in self._shards:
             shard.purge_expired()
 
-    def create(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
+    def create(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         self._bucket(key).create(key, value, ttl)
-        self._wal.log("create", key, value, ttl)
-        self._replication.enqueue_change("create", key, value, ttl)
+        lsn = 0
+        if not skip_wal:
+            lsn = self._wal.log("create", key, value, ttl)
+        if not skip_replication:
+            self._replication.enqueue_change("create", key, value, ttl, lsn=lsn)
 
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
 
-    def update(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
+    def update(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         self._bucket(key).update(key, value, ttl)
-        self._wal.log("update", key, value, ttl)
-        self._replication.enqueue_change("update", key, value, ttl)
+        lsn = 0
+        if not skip_wal:
+            lsn = self._wal.log("update", key, value, ttl)
+        if not skip_replication:
+            self._replication.enqueue_change("update", key, value, ttl, lsn=lsn)
 
-    def delete(self, key: Any) -> None:
+    def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
         self._bucket(key).delete(key)
-        self._wal.log("delete", key)
-        self._replication.enqueue_change("delete", key)
+        lsn = 0
+        if not skip_wal:
+            lsn = self._wal.log("delete", key)
+        if not skip_replication:
+            self._replication.enqueue_change("delete", key, lsn=lsn)
 
-    def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None) -> None:
+    def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
         for k, v in items.items():
             grouped[self._idx(k)][k] = v
         for idx, sub in grouped.items():
             self._shards[idx].mset(sub, ttl)
-        self._wal.log("mset", items, ttl=ttl)
-        self._replication.enqueue_change("mset", items, ttl=ttl)
+        lsn = 0
+        if not skip_wal:
+            lsn = self._wal.log("mset", items, ttl=ttl)
+        if not skip_replication:
+            self._replication.enqueue_change("mset", items, ttl=ttl, lsn=lsn)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
@@ -98,10 +110,13 @@ class ShardedKeyValueStore(object):
             out.update(self._shards[idx].mget(sub))
         return out
 
-    def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None) -> float:
+    def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> float:
         val = self._bucket(key).incr(key, delta, ttl)
-        self._wal.log("incr", key, delta, ttl)
-        self._replication.enqueue_change("incr", key, delta, ttl)
+        lsn = 0
+        if not skip_wal:
+            lsn = self._wal.log("incr", key, delta, ttl)
+        if not skip_replication:
+            self._replication.enqueue_change("incr", key, delta, ttl, lsn=lsn)
         return val
 
     def keys(self) -> List[Any]:

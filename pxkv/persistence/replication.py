@@ -26,7 +26,7 @@ class ReplicationManager:
         
         # Follower specific
         self.leader_addr = settings.REPLICATION_LEADER_ADDR
-        self._last_wal_offset = 0
+        self._last_applied_lsn = 0
 
     def start(self):
         if self.role == "leader":
@@ -35,35 +35,56 @@ class ReplicationManager:
                 threading.Thread(target=self._leader_replication_loop, daemon=True).start()
         else:
             logging.info("Starting replication as FOLLOWER. Leader: %s", self.leader_addr)
-            # Initial Full Sync
-            self._initial_full_sync()
+            # Initial Full Sync in background to not block the server startup
             threading.Thread(target=self._follower_replication_loop, daemon=True).start()
 
     def _initial_full_sync(self):
-        """Follower pulls full snapshot from leader on startup"""
+        """Follower pulls full snapshot from leader on startup with retries"""
         logging.info("Performing initial full sync from leader: %s", self.leader_addr)
-        try:
-            url = f"http://{self.leader_addr}/replication/snapshot"
-            resp = requests.get(url, timeout=10.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                self.store.load(data)
-                logging.info("Initial full sync completed successfully")
-            else:
-                logging.error("Failed to pull snapshot from leader: %s", resp.text)
-        except Exception as e:
-            logging.error("Initial full sync failed: %s", e)
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                url = f"http://{self.leader_addr}/replication/snapshot"
+                resp = requests.get(url, timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    lsn = data.pop("_lsn", 0)
+                    self.store.load(data)
+                    self._last_applied_lsn = lsn
+                    logging.info("Initial full sync completed successfully. LSN: %d", lsn)
+                    return
+                else:
+                    logging.error("Failed to pull snapshot from leader: %s", resp.text)
+            except Exception as e:
+                logging.warning("Initial full sync attempt %d failed: %s", i+1, e)
+            
+            if i < max_retries - 1:
+                time.sleep(2.0)
+        
+        logging.error("Initial full sync failed after %d retries", max_retries)
 
     def stop(self):
         self._stop_event.set()
 
-    def enqueue_change(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None):
+    def enqueue_change(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None, lsn: int = 0):
         """Called by store when a change happens (Leader only)"""
         if self.role == "leader" and self.followers:
+            
+            def _serialize(obj):
+                if isinstance(obj, (bytes, bytearray)):
+                    return obj.decode("utf-8", errors="replace")
+                return obj
+
+            serialized_val = _serialize(value) if value is not None else None
+            serialized_key = key
+            if op == "mset" and isinstance(key, dict):
+                serialized_key = {k: _serialize(v) for k, v in key.items()}
+            
             self.replication_queue.put({
+                "lsn": lsn,
                 "op": op,
-                "key": key,
-                "value": value,
+                "key": serialized_key,
+                "value": serialized_val,
                 "ttl": ttl,
                 "ts": time.time()
             })
@@ -95,42 +116,67 @@ class ReplicationManager:
                 logging.error("Leader replication error: %s", e)
 
     def _follower_replication_loop(self):
-        """Follower can optionally pull if push is missed, or handle heartbeats"""
-        # For now, we rely on Leader pushing via /replication/sync
-        # But we could implement a pull-based recovery here if needed
+        """Follower handles catch-up and monitoring"""
+        # 1. Try initial full sync
+        self._initial_full_sync()
+        
+        # 2. Periodically check if we are behind and pull from WAL
         while not self._stop_event.is_set():
-            time.sleep(10.0) # Heartbeat/Health check interval
-            # Add health check logic to leader if needed
+            try:
+                # Check if we need to pull missing WAL entries
+                # This is a backup mechanism in case push failed
+                url = f"http://{self.leader_addr}/replication/wal?start_lsn={self._last_applied_lsn}"
+                resp = requests.get(url, timeout=2.0)
+                if resp.status_code == 200:
+                    changes = resp.json().get("changes", [])
+                    if changes:
+                        logging.info("Pulled %d missed changes from WAL", len(changes))
+                        self.apply_changes(changes)
+                elif resp.status_code == 410:
+                    # Leader says WAL is too old, need full sync
+                    logging.warning("Follower too far behind. Triggering full sync.")
+                    self._initial_full_sync()
+            except Exception as e:
+                logging.debug("Follower catch-up error: %s", e)
+            
+            time.sleep(settings.REPLICATION_SYNC_INTERVAL)
 
     def apply_changes(self, changes: List[Dict[str, Any]]):
         """Applied by Follower when receiving changes from Leader"""
         if self.role != "follower":
             return
             
+        # Sort by LSN just in case
+        changes.sort(key=lambda x: x.get("lsn", 0))
+        
         for change in changes:
+            lsn = change.get("lsn", 0)
+            if lsn <= self._last_applied_lsn:
+                continue
+                
             op = change["op"]
             key = change["key"]
             val = change.get("value")
             ttl = change.get("ttl")
             
-            # Apply to store bypassing WAL to avoid loops (or handle appropriately)
-            # Here we use store methods directly
             try:
                 if op == "create":
                     try:
-                        self.store.create(key, val, ttl)
+                        self.store.create(key, val, ttl, skip_replication=True)
                     except KeyError:
-                        self.store.update(key, val, ttl)
+                        self.store.update(key, val, ttl, skip_replication=True)
                 elif op == "update":
-                    self.store.update(key, val, ttl)
+                    self.store.update(key, val, ttl, skip_replication=True)
                 elif op == "delete":
                     try:
-                        self.store.delete(key)
+                        self.store.delete(key, skip_replication=True)
                     except KeyError:
                         pass
                 elif op == "mset":
-                    self.store.mset(key, ttl)
+                    self.store.mset(key, ttl, skip_replication=True)
                 elif op == "incr":
-                    self.store.incr(key, val, ttl)
+                    self.store.incr(key, val, ttl, skip_replication=True)
+                
+                self._last_applied_lsn = lsn
             except Exception as e:
-                logging.error("Follower failed to apply change %s: %s", change, e)
+                logging.error("Follower failed to apply change LSN %d: %s", lsn, e)

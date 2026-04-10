@@ -39,9 +39,6 @@ if settings.SNAPSHOT_FILE:
 if settings.WAL_FILE:
     recover_from_wal(STORE, settings.WAL_FILE)
 
-# Start replication after recovery
-STORE._replication.start()
-
 _REDIS_SERVER: RedisServer | None = None
 if settings.REDIS_ENABLED:
     _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -125,9 +122,24 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide snapshot")
                     return
-                # Return full dump
-                self._json(200, STORE.dump())
+                # Return full dump + current LSN
+                data = STORE.dump()
+                data["_lsn"] = STORE._wal._lsn
+                self._json(200, data)
                 self._inc_metrics("GET", route="GET /replication/snapshot")
+                return
+
+            # Replication WAL entries (Leader only)
+            if parts == ["replication", "wal"]:
+                if settings.REPLICATION_ROLE != "leader":
+                    self._send(403, "Only leader can provide WAL")
+                    return
+                start_lsn = int(query.get("start_lsn", [0])[0])
+                entries = STORE._wal.get_entries(start_lsn)
+                # If we don't have the start_lsn anymore (rotation not implemented yet but good practice)
+                # we would return 410. For now, we return entries.
+                self._json(200, {"changes": entries})
+                self._inc_metrics("GET", route="GET /replication/wal")
                 return
 
             if parts[0] == "admin":
@@ -421,6 +433,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
 
 def run() -> None:
+    # Start replication manager
+    STORE._replication.start()
+
     httpd = BaseHTTPServer.HTTPServer((settings.HOST, settings.PORT), KVHandler)
     logging.info(
         "Serving on http://%s:%d  shards=%d per_shard_max=%d",
