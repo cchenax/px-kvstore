@@ -7,6 +7,8 @@ import os
 import threading
 import time
 
+from ..config.settings import settings
+
 def load_snapshot(store, path: str) -> bool:
     if not path or not os.path.exists(path):
         return False
@@ -50,9 +52,14 @@ class SnapshotManager(threading.Thread):
         self._stop_event.set()
 
     def run(self) -> None:
-        logging.info("Snapshot manager started (interval=%.1fs)", self.interval)
+        logging.info("Snapshot manager started (interval=%.1fs)", settings.SNAPSHOT_INTERVAL)
         while not self._stop_event.is_set():
-            time.sleep(self.interval)
+            interval = settings.SNAPSHOT_INTERVAL
+            if interval <= 0:
+                time.sleep(1.0) # Check again later if it was enabled
+                continue
+            
+            time.sleep(interval)
             if self._stop_event.is_set():
                 break
             self.snapshot_once()

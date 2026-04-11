@@ -378,6 +378,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /kv/batch")
                 return
 
+            if parts == ["admin", "config"]:
+                payload = json.loads(self._body() or b"{}")
+                settings.update(payload)
+                self._json(200, {"status": "ok", "config": settings.to_dict()})
+                self._inc_metrics("POST", route="POST /admin/config")
+                return
+
             self._send(404, "Not Found")
             self._inc_metrics("POST", route="POST (not_found)", error=True)
         except ValueError:
@@ -424,6 +431,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send(500, f"snapshot failed: {e}")
                 self._inc_metrics("GET", route="GET /admin/snapshot", error=True)
             return
+        
+        if parts[0] == "config":
+            self._json(200, settings.to_dict())
+            self._inc_metrics("GET", route="GET /admin/config")
+            return
+
         self._send(404, "Not Found")
         self._inc_metrics("GET", route="GET /admin (not_found)", error=True)
 
@@ -450,8 +463,14 @@ def run() -> None:
         httpd.shutdown()
         sys.exit(0)
 
+    def reload_config(sig: int, _frame: Any) -> None:
+        logging.info("SIGHUP received, reloading config from environment…")
+        settings.reload()
+
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, reload_config)
     httpd.serve_forever()
 
 if __name__ == "__main__":
