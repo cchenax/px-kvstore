@@ -3,16 +3,19 @@
 
 import os
 import logging
-from threading import Lock
+import json
+from threading import RLock
 
 class Settings:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self.reload()
 
     def reload(self):
         """Reload settings from environment variables."""
         with self._lock:
+            self.CONFIG_FILE = os.getenv("PXKV_CONFIG_FILE", "")
+
             self.HOST = os.getenv("PXKV_HOST", "0.0.0.0")
             self.PORT = int(os.getenv("PXKV_PORT", "8000"))
             self.SHARDS = int(os.getenv("PXKV_SHARD_COUNT", os.getenv("SHARD_COUNT", "4")))
@@ -34,6 +37,15 @@ class Settings:
             self.REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
             self.REPLICATION_FOLLOWERS = [f for f in os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") if f]
             self.REPLICATION_SYNC_INTERVAL = float(os.getenv("PXKV_REPLICATION_SYNC_INTERVAL", "1.0"))
+
+            if self.CONFIG_FILE:
+                try:
+                    if os.path.exists(self.CONFIG_FILE):
+                        with open(self.CONFIG_FILE, "r") as f:
+                            data = json.load(f) or {}
+                        self.update(data)
+                except Exception as e:
+                    logging.warning("Failed to load config file %s: %s", self.CONFIG_FILE, e)
             logging.info("Settings reloaded from environment.")
 
     def update(self, new_settings: dict):
@@ -45,6 +57,7 @@ class Settings:
                 "FAULT_LATENCY_JITTER_MS": float,
                 "SNAPSHOT_INTERVAL": float,
                 "REPLICATION_SYNC_INTERVAL": float,
+                "REDIS_ENABLED": lambda v: str(v).lower() == "true",
             }
             for key, val in new_settings.items():
                 if key in updatable:

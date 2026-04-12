@@ -37,7 +37,7 @@ if settings.SNAPSHOT_FILE:
     load_snapshot(STORE, settings.SNAPSHOT_FILE)
 
 if settings.WAL_FILE:
-    recover_from_wal(STORE, settings.WAL_FILE)
+    recover_from_wal(STORE, STORE._wal)
 
 _REDIS_SERVER: RedisServer | None = None
 if settings.REDIS_ENABLED:
@@ -383,6 +383,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 settings.update(payload)
                 self._json(200, {"status": "ok", "config": settings.to_dict()})
                 self._inc_metrics("POST", route="POST /admin/config")
+                return
+
+            if parts == ["admin", "config", "reload"]:
+                settings.reload()
+                self._json(200, {"status": "ok", "config": settings.to_dict()})
+                self._inc_metrics("POST", route="POST /admin/config/reload")
                 return
 
             self._send(404, "Not Found")
