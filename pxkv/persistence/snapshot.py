@@ -56,7 +56,7 @@ class SnapshotManager(threading.Thread):
         while not self._stop_event.is_set():
             interval = settings.SNAPSHOT_INTERVAL
             if interval <= 0:
-                time.sleep(1.0) # Check again later if it was enabled
+                time.sleep(1.0)
                 continue
             
             time.sleep(interval)

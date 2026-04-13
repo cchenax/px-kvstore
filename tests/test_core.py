@@ -37,8 +37,8 @@ class TestLRUStore:
     def test_eviction(self, lru_store):
         lru_store.create("p", 1)
         lru_store.create("q", 2)
-        _ = lru_store.read("p")  # Touch 'p'
-        lru_store.create("r", 3)  # Should evict 'q'
+        _ = lru_store.read("p")
+        lru_store.create("r", 3)
         with pytest.raises(KeyError):
             lru_store.read("q")
         assert lru_store.read("p") == 1
@@ -59,10 +59,9 @@ class TestLFUStore:
     def test_eviction(self, lfu_store):
         lfu_store.create("p", 1)
         lfu_store.create("q", 2)
-        # Touch 'q' more times than 'p'
         _ = lfu_store.read("q")
         _ = lfu_store.read("q")
-        lfu_store.create("r", 3)  # Should evict 'p'
+        lfu_store.create("r", 3)
         with pytest.raises(KeyError):
             lfu_store.read("p")
         assert lfu_store.read("q") == 2
@@ -76,7 +75,6 @@ class TestShardedStore:
     def test_scan_prefix_and_pagination(self, sharded_store):
         sharded_store.mset({"foo": 1, "foo2": 2, "bar": 3, "fop": 4})
         assert sorted(sharded_store.scan(prefix="fo", limit=10)) == ["foo", "foo2", "fop"]
-        # Note: the order in scan depends on the K-way merge of sorted shard keys
         results = sharded_store.scan(prefix="fo", limit=10)
         assert "foo" in results
         assert "foo2" in results

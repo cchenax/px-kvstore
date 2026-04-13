@@ -6,11 +6,10 @@ from pxkv.config.settings import settings
 
 @pytest.fixture(scope="module")
 def redis_server():
-    # Use a different port for testing
     test_port = 16379
     server = RedisServer(STORE, host="127.0.0.1", port=test_port)
     server.start()
-    time.sleep(0.5) # Wait for start
+    time.sleep(0.5)
     yield server
     server.stop()
 

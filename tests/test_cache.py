@@ -12,7 +12,7 @@ class TestAICache:
         assert k1 == k2
         assert c1 == c2
         assert isinstance(k1, str)
-        assert len(k1) == 64 # SHA-256
+        assert len(k1) == 64
         
     def test_key_changes_on_input(self):
         k1, _ = compute_ai_cache_key(prompt="hi", model="m", params={})

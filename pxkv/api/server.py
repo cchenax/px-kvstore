@@ -49,6 +49,32 @@ if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
     _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
     _SNAPSHOT_MANAGER.start()
 
+def _apply_runtime_config() -> None:
+    global _REDIS_SERVER
+    global _SNAPSHOT_MANAGER
+
+    if settings.REDIS_ENABLED:
+        if _REDIS_SERVER is None:
+            _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
+            _REDIS_SERVER.start()
+    else:
+        if _REDIS_SERVER is not None:
+            try:
+                _REDIS_SERVER.stop()
+            finally:
+                _REDIS_SERVER = None
+
+    if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
+        if _SNAPSHOT_MANAGER is None:
+            _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
+            _SNAPSHOT_MANAGER.start()
+    else:
+        if _SNAPSHOT_MANAGER is not None:
+            try:
+                _SNAPSHOT_MANAGER.stop()
+            finally:
+                _SNAPSHOT_MANAGER = None
+
 class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     server_version = "PX-KVStore/2.0"
 
@@ -117,7 +143,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._json(200, {"status": "ok"})
                 return
 
-            # Replication Snapshot (Leader only)
             if parts == ["replication", "snapshot"]:
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide snapshot")
@@ -129,7 +154,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("GET", route="GET /replication/snapshot")
                 return
 
-            # Replication WAL entries (Leader only)
             if parts == ["replication", "wal"]:
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide WAL")
@@ -264,7 +288,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         try:
             parts, _ = self._parse()
             
-            # Replication Sync (Follower only)
             if parts == ["replication", "sync"]:
                 if settings.REPLICATION_ROLE != "follower":
                     self._send(403, "Only followers can receive sync")
@@ -381,12 +404,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if parts == ["admin", "config"]:
                 payload = json.loads(self._body() or b"{}")
                 settings.update(payload)
+                _apply_runtime_config()
                 self._json(200, {"status": "ok", "config": settings.to_dict()})
                 self._inc_metrics("POST", route="POST /admin/config")
                 return
 
             if parts == ["admin", "config", "reload"]:
                 settings.reload()
+                _apply_runtime_config()
                 self._json(200, {"status": "ok", "config": settings.to_dict()})
                 self._inc_metrics("POST", route="POST /admin/config/reload")
                 return
@@ -403,7 +428,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "shards": settings.SHARDS, "role": settings.REPLICATION_ROLE})
             self._inc_metrics("GET", route="GET /admin")
             return
-        # ... existing logic ...
         if parts[0] == "health":
             self._json(
                 200,
@@ -452,7 +476,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
 
 def run() -> None:
-    # Start replication manager
     STORE._replication.start()
 
     httpd = BaseHTTPServer.HTTPServer((settings.HOST, settings.PORT), KVHandler)
@@ -472,6 +495,7 @@ def run() -> None:
     def reload_config(sig: int, _frame: Any) -> None:
         logging.info("SIGHUP received, reloading config from environment…")
         settings.reload()
+        _apply_runtime_config()
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
