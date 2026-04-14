@@ -1,15 +1,56 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import json
 import logging
 import threading
 import time
-import requests
 import queue
-from typing import Any, Dict, List, Optional
+import json
+import urllib.request
+import urllib.error
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.settings import settings
+
+def _http_get_json(url: str, timeout: float) -> Tuple[int, Any, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read()
+            text = raw.decode("utf-8", errors="replace")
+            if not text:
+                return resp.status, None, ""
+            return resp.status, json.loads(text), text
+    except urllib.error.HTTPError as e:
+        try:
+            text = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        return int(getattr(e, "code", 500)), None, text
+    except Exception as e:
+        return 0, None, str(e)
+
+
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Tuple[int, str]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            text = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        return int(getattr(e, "code", 500)), text
+    except Exception as e:
+        return 0, str(e)
+
 
 class ReplicationManager:
     """
@@ -20,11 +61,9 @@ class ReplicationManager:
         self.role = settings.REPLICATION_ROLE
         self._stop_event = threading.Event()
         
-        # Leader specific
         self.replication_queue = queue.Queue()
         self.followers = [f for f in settings.REPLICATION_FOLLOWERS if f]
         
-        # Follower specific
         self.leader_addr = settings.REPLICATION_LEADER_ADDR
         self._last_applied_lsn = 0
 
@@ -35,28 +74,21 @@ class ReplicationManager:
                 threading.Thread(target=self._leader_replication_loop, daemon=True).start()
         else:
             logging.info("Starting replication as FOLLOWER. Leader: %s", self.leader_addr)
-            # Initial Full Sync in background to not block the server startup
             threading.Thread(target=self._follower_replication_loop, daemon=True).start()
 
     def _initial_full_sync(self):
-        """Follower pulls full snapshot from leader on startup with retries"""
         logging.info("Performing initial full sync from leader: %s", self.leader_addr)
         max_retries = 5
         for i in range(max_retries):
-            try:
-                url = f"http://{self.leader_addr}/replication/snapshot"
-                resp = requests.get(url, timeout=5.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    lsn = data.pop("_lsn", 0)
-                    self.store.load(data)
-                    self._last_applied_lsn = lsn
-                    logging.info("Initial full sync completed successfully. LSN: %d", lsn)
-                    return
-                else:
-                    logging.error("Failed to pull snapshot from leader: %s", resp.text)
-            except Exception as e:
-                logging.warning("Initial full sync attempt %d failed: %s", i+1, e)
+            url = f"http://{self.leader_addr}/replication/snapshot"
+            status, data, text = _http_get_json(url, timeout=5.0)
+            if status == 200 and isinstance(data, dict):
+                lsn = int(data.pop("_lsn", 0) or 0)
+                self.store.load(data)
+                self._last_applied_lsn = lsn
+                logging.info("Initial full sync completed successfully. LSN: %d", lsn)
+                return
+            logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
             
             if i < max_retries - 1:
                 time.sleep(2.0)
@@ -90,51 +122,37 @@ class ReplicationManager:
             })
 
     def _leader_replication_loop(self):
-        """Leader pushes changes to all followers asynchronously"""
         while not self._stop_event.is_set():
             try:
-                # Get batch of changes
                 changes = []
                 try:
-                    # Wait for at least one change
                     changes.append(self.replication_queue.get(timeout=1.0))
-                    # Collect more if available immediately
                     while len(changes) < 100:
                         changes.append(self.replication_queue.get_nowait())
                 except queue.Empty:
                     if not changes:
                         continue
 
-                # Broadcast to all followers
                 for follower in self.followers:
-                    try:
-                        url = f"http://{follower}/replication/sync"
-                        requests.post(url, json={"changes": changes}, timeout=2.0)
-                    except Exception as e:
-                        logging.warning("Failed to sync with follower %s: %s", follower, e)
+                    url = f"http://{follower}/replication/sync"
+                    status, _text = _http_post_json(url, {"changes": changes}, timeout=2.0)
+                    if status not in (200, 0):
+                        logging.warning("Follower sync returned %s for %s", status, follower)
             except Exception as e:
                 logging.error("Leader replication error: %s", e)
 
     def _follower_replication_loop(self):
-        """Follower handles catch-up and monitoring"""
-        # 1. Try initial full sync
         self._initial_full_sync()
         
-        # 2. Periodically check if we are behind and pull from WAL
         while not self._stop_event.is_set():
             try:
-                # Check if we need to pull missing WAL entries
-                # This is a backup mechanism in case push failed
                 url = f"http://{self.leader_addr}/replication/wal?start_lsn={self._last_applied_lsn}"
-                resp = requests.get(url, timeout=2.0)
-                if resp.status_code == 200:
-                    changes = resp.json().get("changes", [])
-                    if changes:
-                        logging.info("Pulled %d missed changes from WAL", len(changes))
+                status, data, _text = _http_get_json(url, timeout=2.0)
+                if status == 200 and isinstance(data, dict):
+                    changes = data.get("changes", [])
+                    if isinstance(changes, list) and changes:
                         self.apply_changes(changes)
-                elif resp.status_code == 410:
-                    # Leader says WAL is too old, need full sync
-                    logging.warning("Follower too far behind. Triggering full sync.")
+                elif status == 410:
                     self._initial_full_sync()
             except Exception as e:
                 logging.debug("Follower catch-up error: %s", e)
@@ -142,11 +160,9 @@ class ReplicationManager:
             time.sleep(settings.REPLICATION_SYNC_INTERVAL)
 
     def apply_changes(self, changes: List[Dict[str, Any]]):
-        """Applied by Follower when receiving changes from Leader"""
         if self.role != "follower":
             return
             
-        # Sort by LSN just in case
         changes.sort(key=lambda x: x.get("lsn", 0))
         
         for change in changes:

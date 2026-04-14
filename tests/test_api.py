@@ -1,9 +1,10 @@
 import os
 import subprocess
 import time
+import json
+import urllib.request
 
 import pytest
-import requests
 
 
 def get_free_port() -> int:
@@ -31,14 +32,15 @@ def http_server():
 
 
 def test_admin_health(http_server):
-    resp = requests.get(f"{http_server}/admin/health")
-    assert resp.status_code == 200
-    body = resp.json()
+    with urllib.request.urlopen(f"{http_server}/admin/health", timeout=2.0) as resp:
+        assert resp.status == 200
+        body = json.loads(resp.read().decode("utf-8"))
     assert body["status"] == "ok"
     assert "uptime_seconds" in body
 
 
 def test_metrics_prometheus(http_server):
-    resp = requests.get(f"{http_server}/admin/metrics?format=prometheus")
-    assert resp.status_code == 200
-    assert "pxkv_requests_total" in resp.text
+    with urllib.request.urlopen(f"{http_server}/admin/metrics?format=prometheus", timeout=2.0) as resp:
+        assert resp.status == 200
+        text = resp.read().decode("utf-8", errors="replace")
+    assert "pxkv_requests_total" in text

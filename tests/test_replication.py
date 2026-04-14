@@ -1,15 +1,48 @@
-import time
-import pytest
-import requests
-import subprocess
 import os
+import json
+import subprocess
+import time
+import urllib.request
+import urllib.error
 
 import socket
 
-def get_free_port():
+import pytest
+
+
+def get_free_port() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(("", 0))
         return str(s.getsockname()[1])
+
+
+def http_put(url: str, data: bytes) -> int:
+    req = urllib.request.Request(url, data=data, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 500))
+
+
+def http_post(url: str, data: bytes = b"") -> int:
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 500))
+
+
+def http_get_json(url: str) -> tuple[int, dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            raw = resp.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 500)), {}
+
 
 @pytest.fixture
 def leader_follower_cluster():
@@ -49,28 +82,28 @@ def leader_follower_cluster():
 def test_replication_basic(leader_follower_cluster):
     leader_port, follower_port = leader_follower_cluster
     leader_url = f"http://localhost:{leader_port}/kv/repl_key"
-    put_resp = requests.put(leader_url, data=b"repl_value")
-    assert put_resp.status_code in [201, 204]
+    status = http_put(leader_url, b"repl_value")
+    assert status in [201, 204]
     
     time.sleep(3.0)
     
     follower_url = f"http://localhost:{follower_port}/kv/repl_key"
-    resp = requests.get(follower_url)
-    assert resp.status_code == 200, f"Follower returned {resp.status_code}: {resp.text}"
-    assert resp.json()["value"] == "repl_value"
+    status, body = http_get_json(follower_url)
+    assert status == 200
+    assert body["value"] == "repl_value"
 
 def test_replication_incr(leader_follower_cluster):
     leader_port, follower_port = leader_follower_cluster
     leader_url = f"http://localhost:{leader_port}/kv/incr/c1"
-    requests.post(leader_url)
-    requests.post(leader_url)
+    assert http_post(leader_url) == 200
+    assert http_post(leader_url) == 200
     
     time.sleep(2.0)
     
     follower_url = f"http://localhost:{follower_port}/kv/c1"
-    resp = requests.get(follower_url)
-    assert resp.status_code == 200
-    assert resp.json()["value"] == 2.0
+    status, body = http_get_json(follower_url)
+    assert status == 200
+    assert body["value"] == 2.0
 
 def test_replication_full_sync():
     leader_port = get_free_port()
@@ -83,7 +116,7 @@ def test_replication_full_sync():
     
     leader_proc = subprocess.Popen(["python3", "server.py"], env=leader_env)
     time.sleep(2.0)
-    requests.put(f"http://localhost:{leader_port}/kv/pre_existing", data=b"pre_value")
+    assert http_put(f"http://localhost:{leader_port}/kv/pre_existing", b"pre_value") in [201, 204]
     
     follower_env = os.environ.copy()
     follower_env["PXKV_PORT"] = follower_port
@@ -94,15 +127,15 @@ def test_replication_full_sync():
     follower_proc = subprocess.Popen(["python3", "server.py"], env=follower_env)
     time.sleep(3.0)
     
-    resp = requests.get(f"http://localhost:{follower_port}/kv/pre_existing")
+    status, body = http_get_json(f"http://localhost:{follower_port}/kv/pre_existing")
     
     leader_proc.terminate()
     follower_proc.terminate()
     leader_proc.wait()
     follower_proc.wait()
     
-    assert resp.status_code == 200
-    assert resp.json()["value"] == "pre_value"
+    assert status == 200
+    assert body["value"] == "pre_value"
 
 def test_replication_catchup():
     leader_port = get_free_port()
@@ -130,26 +163,28 @@ def test_replication_catchup():
     follower_proc = subprocess.Popen(["python3", "server.py"], env=follower_env)
     time.sleep(3.0)
     
-    requests.put(f"http://localhost:{leader_port}/kv/k1", data=b"v1")
+    assert http_put(f"http://localhost:{leader_port}/kv/k1", b"v1") in [201, 204]
     time.sleep(2.0)
-    assert requests.get(f"http://localhost:{follower_port}/kv/k1").json()["value"] == "v1"
+    status, body = http_get_json(f"http://localhost:{follower_port}/kv/k1")
+    assert status == 200
+    assert body["value"] == "v1"
     
     follower_proc.terminate()
     follower_proc.wait()
     
-    requests.put(f"http://localhost:{leader_port}/kv/k2", data=b"v2")
-    requests.put(f"http://localhost:{leader_port}/kv/k3", data=b"v3")
+    assert http_put(f"http://localhost:{leader_port}/kv/k2", b"v2") in [201, 204]
+    assert http_put(f"http://localhost:{leader_port}/kv/k3", b"v3") in [201, 204]
     
     follower_proc = subprocess.Popen(["python3", "server.py"], env=follower_env)
     time.sleep(5.0)
     
-    resp2 = requests.get(f"http://localhost:{follower_port}/kv/k2")
-    resp3 = requests.get(f"http://localhost:{follower_port}/kv/k3")
+    status2, body2 = http_get_json(f"http://localhost:{follower_port}/kv/k2")
+    status3, body3 = http_get_json(f"http://localhost:{follower_port}/kv/k3")
     
     leader_proc.terminate()
     follower_proc.terminate()
     leader_proc.wait()
     follower_proc.wait()
     
-    assert resp2.status_code == 200 and resp2.json()["value"] == "v2"
-    assert resp3.status_code == 200 and resp3.json()["value"] == "v3"
+    assert status2 == 200 and body2["value"] == "v2"
+    assert status3 == 200 and body3["value"] == "v3"

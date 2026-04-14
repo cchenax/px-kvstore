@@ -30,17 +30,15 @@ class ShardedKeyValueStore(object):
             raise ValueError(f"unknown eviction_policy: {eviction_policy!r}")
         self._eviction_policy = policy
         self._shards = [factory() for _ in range(shards)]
-        
-        # Consistent hashing ring
-        self._ring: List[Tuple[int, int]] = [] # list of (hash_value, shard_index)
+
+        self._ring: List[Tuple[int, int]] = []
         for i in range(shards):
             for v in range(vnodes):
-                # virtual node key: e.g. "shard_0_vnode_42"
                 v_key = f"shard_{i}_v_{v}".encode("utf-8")
                 h = binascii.crc32(v_key)
                 self._ring.append((h, i))
         self._ring.sort()
-        
+
         self._wal = WAL(wal_path)
         self._replication = ReplicationManager(self)
 
@@ -48,8 +46,7 @@ class ShardedKeyValueStore(object):
         if isinstance(key, str):
             key = key.encode("utf-8")
         h = binascii.crc32(key)
-        
-        # Find the first vnode with hash >= h
+
         idx = bisect.bisect_left(self._ring, (h, 0))
         if idx == len(self._ring):
             idx = 0

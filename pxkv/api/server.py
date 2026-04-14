@@ -132,7 +132,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             elapsed_ms = (time.time() - self._request_started_at) * 1000.0
             registry.observe_latency(route, elapsed_ms)
 
-    # Core KV APIs
     def do_GET(self) -> None:
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()
@@ -147,7 +146,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide snapshot")
                     return
-                # Return full dump + current LSN
                 data = STORE.dump()
                 data["_lsn"] = STORE._wal._lsn
                 self._json(200, data)
@@ -159,9 +157,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._send(403, "Only leader can provide WAL")
                     return
                 start_lsn = int(query.get("start_lsn", [0])[0])
+                oldest = STORE._wal.get_oldest_lsn()
+                if oldest and start_lsn < oldest - 1:
+                    self._send(410, "WAL truncated, full sync required")
+                    self._inc_metrics("GET", route="GET /replication/wal", error=True)
+                    return
                 entries = STORE._wal.get_entries(start_lsn)
-                # If we don't have the start_lsn anymore (rotation not implemented yet but good practice)
-                # we would return 410. For now, we return entries.
                 self._json(200, {"changes": entries})
                 self._inc_metrics("GET", route="GET /replication/wal")
                 return
@@ -422,7 +423,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send(400, "Bad JSON")
             self._inc_metrics("POST", route="POST (bad_json)", error=True)
 
-    # Admin & metrics APIs
     def _handle_admin_get(self, parts: list[str], query: Dict[str, list[str]]) -> None:
         if not parts:
             self._json(200, {"status": "ok", "shards": settings.SHARDS, "role": settings.REPLICATION_ROLE})

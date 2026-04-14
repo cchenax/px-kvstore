@@ -2,9 +2,9 @@ import json
 import os
 import subprocess
 import time
+import urllib.request
 
 import pytest
-import requests
 
 
 def get_free_port() -> int:
@@ -36,16 +36,26 @@ def server(tmp_path):
 def test_config_hot_reload_api(server):
     base_url, _proc, _config_file = server
 
-    resp = requests.get(f"{base_url}/admin/config")
-    assert resp.status_code == 200
-    assert resp.json()["FAULT_LATENCY_MS"] == 0.0
+    with urllib.request.urlopen(f"{base_url}/admin/config", timeout=2.0) as resp:
+        assert resp.status == 200
+        body = json.loads(resp.read().decode("utf-8"))
+    assert body["FAULT_LATENCY_MS"] == 0.0
 
-    update_resp = requests.post(f"{base_url}/admin/config", json={"FAULT_LATENCY_MS": 100.0})
-    assert update_resp.status_code == 200
-    assert update_resp.json()["config"]["FAULT_LATENCY_MS"] == 100.0
+    data = json.dumps({"FAULT_LATENCY_MS": 100.0}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/admin/config",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        assert resp.status == 200
+        updated = json.loads(resp.read().decode("utf-8"))
+    assert updated["config"]["FAULT_LATENCY_MS"] == 100.0
 
     start = time.perf_counter()
-    requests.get(f"{base_url}/")
+    with urllib.request.urlopen(f"{base_url}/", timeout=2.0) as _resp:
+        pass
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     assert elapsed_ms >= 70.0
 
@@ -54,9 +64,16 @@ def test_config_reload_from_file(server):
     base_url, _proc, config_file = server
 
     config_file.write_text(json.dumps({"FAULT_LATENCY_MS": 50.0}), encoding="utf-8")
-    reload_resp = requests.post(f"{base_url}/admin/config/reload", json={})
-    assert reload_resp.status_code == 200
+    req = urllib.request.Request(
+        f"{base_url}/admin/config/reload",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        assert resp.status == 200
 
-    resp = requests.get(f"{base_url}/admin/config")
-    assert resp.status_code == 200
-    assert resp.json()["FAULT_LATENCY_MS"] == 50.0
+    with urllib.request.urlopen(f"{base_url}/admin/config", timeout=2.0) as resp:
+        assert resp.status == 200
+        body = json.loads(resp.read().decode("utf-8"))
+    assert body["FAULT_LATENCY_MS"] == 50.0

@@ -112,7 +112,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Redis Protocol Compatibility**: Use `redis-py` or `redis-cli` directly on port 6379.
 - [x] **Asynchronous Replication**: Leader-Follower setup with full sync and incremental sync.
 - [x] **Prometheus Metrics**: Export metrics in Prometheus format for integration with Grafana.
-- [ ] **Config hot reload**: Dynamic configuration updates.
+- [x] **Config hot reload**: Dynamic configuration updates.
 
 ---
 

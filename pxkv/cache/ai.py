@@ -7,7 +7,6 @@ import zlib
 import base64
 from typing import Any, Dict, Tuple, Optional, Callable
 
-# Default normalization: lowercasing prompts and removing extra whitespace
 def default_normalize(prompt: str) -> str:
     return " ".join(prompt.lower().split())
 
@@ -27,7 +26,6 @@ class AICacheManager:
             "model_version": model_version,
             "params": params,
         }
-        # Canonical JSON
         canon = json.dumps(obj, sort_keys=True, ensure_ascii=False)
         h = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         return h, canon
@@ -36,7 +34,6 @@ class AICacheManager:
         """Compress response value if it's large string."""
         if not isinstance(value, str):
             return value
-        # Only compress if > 1KB
         if len(value) < 1024:
             return value
         compressed = zlib.compress(value.encode("utf-8"))
@@ -50,6 +47,5 @@ class AICacheManager:
 
 ai_cache_manager = AICacheManager()
 
-# For backward compatibility or direct use
 def compute_ai_cache_key(prompt: str, model: str, params: Dict[str, Any]) -> Tuple[str, str]:
     return ai_cache_manager.compute_key(prompt, model, params)

@@ -10,7 +10,6 @@ from typing import Any, List, Optional
 from ..metrics.registry import registry
 from ..config.settings import settings
 
-# RESP protocol implementation
 def encode_simple_string(s: str) -> bytes:
     return f"+{s}\r\n".encode("utf-8")
 
@@ -88,7 +87,6 @@ class RedisServer(threading.Thread):
                     break
                 
                 if line[0:1] != b"*":
-                    # Simple inline commands not supported for now, only arrays (standard for clients)
                     continue
                 
                 num_args = int(line[1:].strip())
@@ -99,7 +97,7 @@ class RedisServer(threading.Thread):
                         break
                     arg_len = int(header[1:].strip())
                     arg = f.read(arg_len)
-                    f.read(2) # CRLF
+                    f.read(2)
                     args.append(arg)
                 
                 if not args:
@@ -128,7 +126,6 @@ class RedisServer(threading.Thread):
                 key = args[1].decode("utf-8")
                 val = args[2].decode("utf-8")
                 ttl = None
-                # Handle EX <seconds> or PX <milliseconds>
                 i = 3
                 while i < len(args):
                     opt = args[i].decode("utf-8").upper()
@@ -141,7 +138,6 @@ class RedisServer(threading.Thread):
                     else:
                         break
                 
-                # Check if it exists for update/create
                 try:
                     self.store.read(key)
                     self.store.update(key, val, ttl)

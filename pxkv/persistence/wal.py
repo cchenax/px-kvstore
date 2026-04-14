@@ -16,7 +16,6 @@ class WAL:
         self._file = None
         self._lsn = 0
         if path:
-            # If path exists, find the last LSN
             if os.path.exists(path):
                 try:
                     with open(path, "r") as f:
@@ -52,12 +51,11 @@ class WAL:
             "value": _serialize(value) if value is not None else None,
             "ttl": ttl
         }
-        # For mset, key is a dict. We need to serialize its values too.
         if op == "mset" and isinstance(key, dict):
             entry["key"] = {k: _serialize(v) for k, v in key.items()}
             
         self._file.write(json.dumps(entry) + "\n")
-        self._file.flush() # Ensure it's on disk
+        self._file.flush()
         return self._lsn
 
     def get_entries(self, start_lsn: int) -> List[Dict[str, Any]]:
@@ -80,6 +78,23 @@ class WAL:
         except Exception as e:
             logging.error("Failed to read WAL entries: %s", e)
         return entries
+
+    def get_oldest_lsn(self) -> int:
+        if not self.path or not os.path.exists(self.path):
+            return 0
+        try:
+            with open(self.path, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        return int(entry.get("lsn", 0))
+                    except Exception:
+                        continue
+        except Exception:
+            return 0
+        return 0
 
     def close(self):
         if self._file:
@@ -106,20 +121,20 @@ def recover_from_wal(store, wal: WAL):
                     
                     if op == "create":
                         try:
-                            store.create(key, val, ttl, skip_wal=True)
+                            store.create(key, val, ttl, skip_wal=True, skip_replication=True)
                         except KeyError:
-                            store.update(key, val, ttl, skip_wal=True)
+                            store.update(key, val, ttl, skip_wal=True, skip_replication=True)
                     elif op == "update":
-                        store.update(key, val, ttl, skip_wal=True)
+                        store.update(key, val, ttl, skip_wal=True, skip_replication=True)
                     elif op == "delete":
                         try:
-                            store.delete(key, skip_wal=True)
+                            store.delete(key, skip_wal=True, skip_replication=True)
                         except KeyError:
                             pass
                     elif op == "mset":
-                        store.mset(key, ttl, skip_wal=True) # key is a dict here
+                        store.mset(key, ttl, skip_wal=True, skip_replication=True)
                     elif op == "incr":
-                        store.incr(key, val, ttl, skip_wal=True) # val is delta
+                        store.incr(key, val, ttl, skip_wal=True, skip_replication=True)
                 except Exception as e:
                     logging.warning("Failed to recover entry: %s", e)
         wal._lsn = max_lsn

@@ -22,7 +22,6 @@ class BackgroundExpirer(threading.Thread):
             if self._stop_event.is_set():
                 break
             try:
-                # We need a method in ShardedKeyValueStore to trigger expiration across all shards
                 self.store.purge_expired()
             except Exception as e:
                 logging.error("Background expiration failed: %s", e)

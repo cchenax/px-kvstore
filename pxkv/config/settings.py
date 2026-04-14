@@ -51,7 +51,6 @@ class Settings:
     def update(self, new_settings: dict):
         """Update specific settings dynamically."""
         with self._lock:
-            # Only allow updating a subset of settings that make sense at runtime
             updatable = {
                 "FAULT_LATENCY_MS": float,
                 "FAULT_LATENCY_JITTER_MS": float,
