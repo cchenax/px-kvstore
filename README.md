@@ -113,6 +113,12 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Asynchronous Replication**: Leader-Follower setup with full sync and incremental sync.
 - [x] **Prometheus Metrics**: Export metrics in Prometheus format for integration with Grafana.
 - [x] **Config hot reload**: Dynamic configuration updates.
+- [ ] **Replica Ack & Lag Metrics**: Track follower replication lag and expose per-follower ack position.
+- [ ] **Read-Only Follower Mode**: Serve safe reads from followers with staleness visibility.
+- [ ] **Snapshot Streaming Compression**: Reduce full-sync bandwidth and recovery time for large datasets.
+- [ ] **Memory Tiering Hooks**: Add extension points for spill-to-disk or external object storage.
+- [ ] **Multi-Key Routing Helpers**: Co-locate related keys via hash-tag strategy for better cross-key operations.
+- [ ] **Auth & ACL**: Add optional token/password auth and command-level access control.
 
 ---
 

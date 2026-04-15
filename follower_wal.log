@@ -1,0 +1,1 @@
+{"lsn": 1, "op": "create", "key": "repl_key", "value": "repl_value", "ttl": null}
