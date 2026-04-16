@@ -46,4 +46,22 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
         cumulative += buckets.get("inf", 0)
         lines.append(f'pxkv_request_latency_ms_bucket{{route="{r_label}",le="+Inf"}} {cumulative}')
 
+    repl = metrics.get("replication", {})
+    lines.append("# HELP pxkv_replication_leader_lsn Current leader WAL LSN.")
+    lines.append("# TYPE pxkv_replication_leader_lsn gauge")
+    lines.append(f"pxkv_replication_leader_lsn {int(repl.get('leader_lsn', 0) or 0)}")
+    lines.append("# HELP pxkv_replication_follower_ack_lsn Last acknowledged LSN by follower.")
+    lines.append("# TYPE pxkv_replication_follower_ack_lsn gauge")
+    lines.append("# HELP pxkv_replication_follower_lag_lsn Leader-to-follower lag in LSN units.")
+    lines.append("# TYPE pxkv_replication_follower_lag_lsn gauge")
+    followers = repl.get("followers", {})
+    for follower, data in followers.items():
+        f_label = str(follower).replace('"', '\\"')
+        lines.append(
+            f'pxkv_replication_follower_ack_lsn{{follower="{f_label}"}} {int(data.get("ack_lsn", 0) or 0)}'
+        )
+        lines.append(
+            f'pxkv_replication_follower_lag_lsn{{follower="{f_label}"}} {int(data.get("lag_lsn", 0) or 0)}'
+        )
+
     return "\n".join(lines) + "\n"

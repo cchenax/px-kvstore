@@ -23,6 +23,10 @@ class MetricsRegistry:
                 "misses": 0,
                 "stores": 0,
             },
+            "replication": {
+                "leader_lsn": 0,
+                "followers": {},
+            },
         }
 
     def inc_requests(self, method: str, error: bool = False):
@@ -58,6 +62,42 @@ class MetricsRegistry:
     def inc_ai_cache(self, metric: str):
         if metric in self._metrics["ai_cache"]:
             self._metrics["ai_cache"][metric] += 1
+
+    def observe_replication_ack(
+        self,
+        follower: str,
+        leader_lsn: int,
+        ack_lsn: int,
+        ok: bool,
+        error: str = "",
+    ) -> None:
+        replication = self._metrics.setdefault("replication", {"leader_lsn": 0, "followers": {}})
+        replication["leader_lsn"] = int(max(0, leader_lsn))
+        followers = replication.setdefault("followers", {})
+        item = followers.setdefault(
+            follower,
+            {
+                "ack_lsn": 0,
+                "lag_lsn": 0,
+                "last_ack_at": 0.0,
+                "last_error_at": 0.0,
+                "last_error": "",
+            },
+        )
+        ack = int(max(0, ack_lsn))
+        item["ack_lsn"] = ack
+        item["lag_lsn"] = int(max(0, int(leader_lsn) - ack))
+        now = time.time()
+        if ok:
+            item["last_ack_at"] = now
+            item["last_error"] = ""
+        else:
+            item["last_error_at"] = now
+            item["last_error"] = error
+
+    def set_replication_leader_lsn(self, leader_lsn: int) -> None:
+        replication = self._metrics.setdefault("replication", {"leader_lsn": 0, "followers": {}})
+        replication["leader_lsn"] = int(max(0, leader_lsn))
 
     def get_all(self) -> Dict[str, Any]:
         return self._metrics

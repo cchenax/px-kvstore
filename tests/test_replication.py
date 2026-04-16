@@ -188,3 +188,24 @@ def test_replication_catchup():
     
     assert status2 == 200 and body2["value"] == "v2"
     assert status3 == 200 and body3["value"] == "v3"
+
+
+def test_replication_ack_and_lag_metrics(leader_follower_cluster):
+    leader_port, follower_port = leader_follower_cluster
+    follower_name = f"localhost:{follower_port}"
+    assert http_put(f"http://localhost:{leader_port}/kv/ack_probe", b"v1") in [201, 204]
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        status, body = http_get_json(f"http://localhost:{leader_port}/admin/metrics")
+        assert status == 200
+        repl = body.get("replication", {})
+        followers = repl.get("followers", {})
+        if follower_name in followers:
+            item = followers[follower_name]
+            if int(item.get("ack_lsn", 0)) > 0:
+                assert int(item.get("lag_lsn", 0)) >= 0
+                return
+        time.sleep(0.5)
+
+    raise AssertionError("replication ack metrics not updated in time")

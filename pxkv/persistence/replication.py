@@ -11,6 +11,7 @@ import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.settings import settings
+from ..metrics.registry import registry
 
 def _http_get_json(url: str, timeout: float) -> Tuple[int, Any, str]:
     try:
@@ -63,6 +64,7 @@ class ReplicationManager:
         
         self.replication_queue = queue.Queue()
         self.followers = [f for f in settings.REPLICATION_FOLLOWERS if f]
+        self._follower_ack_lsn: Dict[str, int] = {f: 0 for f in self.followers}
         
         self.leader_addr = settings.REPLICATION_LEADER_ADDR
         self._last_applied_lsn = 0
@@ -101,6 +103,7 @@ class ReplicationManager:
     def enqueue_change(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None, lsn: int = 0):
         """Called by store when a change happens (Leader only)"""
         if self.role == "leader" and self.followers:
+            registry.set_replication_leader_lsn(lsn)
             
             def _serialize(obj):
                 if isinstance(obj, (bytes, bytearray)):
@@ -135,9 +138,32 @@ class ReplicationManager:
 
                 for follower in self.followers:
                     url = f"http://{follower}/replication/sync"
-                    status, _text = _http_post_json(url, {"changes": changes}, timeout=2.0)
+                    status, text = _http_post_json(url, {"changes": changes}, timeout=2.0)
+                    leader_lsn = int(getattr(self.store._wal, "_lsn", 0) or 0)
+                    ack_lsn = self._follower_ack_lsn.get(follower, 0)
+                    if status == 200:
+                        try:
+                            payload = json.loads(text) if text else {}
+                        except ValueError:
+                            payload = {}
+                        ack_lsn = int(payload.get("last_applied_lsn", ack_lsn) or ack_lsn)
+                        self._follower_ack_lsn[follower] = ack_lsn
+                        registry.observe_replication_ack(
+                            follower=follower,
+                            leader_lsn=leader_lsn,
+                            ack_lsn=ack_lsn,
+                            ok=True,
+                        )
+                        continue
                     if status not in (200, 0):
                         logging.warning("Follower sync returned %s for %s", status, follower)
+                    registry.observe_replication_ack(
+                        follower=follower,
+                        leader_lsn=leader_lsn,
+                        ack_lsn=ack_lsn,
+                        ok=False,
+                        error=f"status={status} detail={text[:120]}",
+                    )
             except Exception as e:
                 logging.error("Leader replication error: %s", e)
 

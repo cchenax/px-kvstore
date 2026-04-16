@@ -296,7 +296,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 payload = json.loads(self._body() or b"{}")
                 changes = payload.get("changes", [])
                 STORE._replication.apply_changes(changes)
-                self._json(200, {"status": "ok", "applied": len(changes)})
+                self._json(
+                    200,
+                    {
+                        "status": "ok",
+                        "applied": len(changes),
+                        "last_applied_lsn": STORE._replication._last_applied_lsn,
+                    },
+                )
                 self._inc_metrics("POST", route="POST /replication/sync")
                 return
 

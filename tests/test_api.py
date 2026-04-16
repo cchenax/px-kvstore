@@ -25,8 +25,16 @@ def http_server():
     env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
 
     proc = subprocess.Popen(["python3", "server.py"], env=env)
-    time.sleep(2.0)
-    yield f"http://localhost:{port}"
+    base = f"http://localhost:{port}"
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            time.sleep(0.2)
+    yield base
     proc.terminate()
     proc.wait()
 
@@ -44,3 +52,4 @@ def test_metrics_prometheus(http_server):
         assert resp.status == 200
         text = resp.read().decode("utf-8", errors="replace")
     assert "pxkv_requests_total" in text
+    assert "pxkv_replication_leader_lsn" in text
