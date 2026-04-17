@@ -11,7 +11,7 @@ import time
 import urllib.parse as urlparse
 import uuid
 import random
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 from ..core.sharded import ShardedKeyValueStore
 from ..persistence.snapshot import SnapshotManager, load_snapshot
@@ -104,18 +104,29 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0"))
         return self.rfile.read(size) if size else b""
 
-    def _send(self, code: int, body: Any = b"", mime: str = "text/plain; charset=utf-8") -> None:
+    def _send(
+        self,
+        code: int,
+        body: Any = b"",
+        mime: str = "text/plain; charset=utf-8",
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         self._ensure_request_context()
         if not isinstance(body, (bytes, bytearray)):
             body = str(body).encode("utf-8")
         self.send_response(code)
         self.send_header("X-Request-Id", self._request_id)
+        if headers:
+            for k, v in headers.items():
+                if v is None:
+                    continue
+                self.send_header(k, str(v))
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, code: int, obj: Any) -> None:
+    def _json(self, code: int, obj: Any, headers: Optional[Dict[str, str]] = None) -> None:
         self._ensure_request_context()
         def _default(v: Any):
             if isinstance(v, (bytes, bytearray)):
@@ -123,7 +134,23 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             raise TypeError
 
         payload = json.dumps(obj, default=_default, ensure_ascii=False)
-        self._send(code, payload.encode("utf-8"), "application/json")
+        self._send(code, payload.encode("utf-8"), "application/json", headers=headers)
+
+    def _staleness_headers(self) -> Dict[str, str]:
+        if settings.REPLICATION_ROLE != "follower":
+            return {}
+        st = STORE._replication.get_staleness()
+        return {
+            "X-PXKV-Role": st.get("role", ""),
+            "X-PXKV-Replication-Last-Applied-LSN": str(st.get("last_applied_lsn", 0)),
+            "X-PXKV-Replication-Known-Leader-LSN": str(st.get("known_leader_lsn", 0)),
+            "X-PXKV-Replication-Lag-LSN": str(st.get("lag_lsn", 0)),
+            "X-PXKV-Replication-Last-Applied-Age-MS": str(st.get("last_applied_age_ms", 0.0)),
+        }
+
+    def _reject_readonly(self, route: str) -> None:
+        self._send(403, "READONLY You can't write against a read-only follower.", headers=self._staleness_headers())
+        self._inc_metrics("WRITE", route=route, error=True)
 
     def _inc_metrics(self, method: str, route: str = "", error: bool = False) -> None:
         registry.inc_requests(method, error)
@@ -163,7 +190,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._inc_metrics("GET", route="GET /replication/wal", error=True)
                     return
                 entries = STORE._wal.get_entries(start_lsn)
-                self._json(200, {"changes": entries})
+                self._json(200, {"leader_lsn": STORE._wal._lsn, "changes": entries})
                 self._inc_metrics("GET", route="GET /replication/wal")
                 return
 
@@ -178,7 +205,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     cache_key = parts[2]
                     storage_key = f"ai:cache:{cache_key}"
                     value = STORE.read(storage_key)
-                    self._json(200, {"key": cache_key, "value": value})
+                    self._json(200, {"key": cache_key, "value": value}, headers=self._staleness_headers())
                     self._inc_metrics("GET", route="GET /ai/cache/:key")
                     return
                 raise ValueError
@@ -192,7 +219,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._inc_metrics("GET", route="GET /kv/batch", error=True)
                     return
                 keys = query["keys"][0].split(",")
-                self._json(200, STORE.mget(keys))
+                self._json(200, STORE.mget(keys), headers=self._staleness_headers())
                 self._inc_metrics("GET", route="GET /kv/batch")
                 return
 
@@ -212,7 +239,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._inc_metrics("GET", route="GET /kv/scan", error=True)
                         return
                 keys = STORE.scan(prefix=prefix, limit=limit, start_after=start_after)
-                self._json(200, {"keys": keys})
+                self._json(200, {"keys": keys}, headers=self._staleness_headers())
                 self._inc_metrics("GET", route="GET /kv/scan")
                 return
 
@@ -221,16 +248,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             key = parts[1]
             value = STORE.read(key)
-            self._json(200, {"key": key, "value": value})
+            self._json(200, {"key": key, "value": value}, headers=self._staleness_headers())
             self._inc_metrics("GET", route="GET /kv/:key")
         except KeyError as e:
-            self._send(404, str(e))
+            self._send(404, str(e), headers=self._staleness_headers())
             if self.path.startswith("/ai/cache/"):
                 self._inc_metrics("GET", route="GET /ai/cache/:key", error=True)
             else:
                 self._inc_metrics("GET", route="GET /kv/:key", error=True)
         except ValueError:
-            self._send(404, "Not Found")
+            self._send(404, "Not Found", headers=self._staleness_headers())
             self._inc_metrics("GET", route="GET (not_found)", error=True)
 
     def do_PUT(self) -> None:
@@ -238,6 +265,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if settings.REPLICATION_ROLE == "follower":
+                self._reject_readonly(route="PUT /kv/:key")
+                return
             parts, query = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
@@ -269,6 +299,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if settings.REPLICATION_ROLE == "follower":
+                self._reject_readonly(route="DELETE /kv/:key")
+                return
             parts, _ = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
@@ -294,6 +327,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._send(403, "Only followers can receive sync")
                     return
                 payload = json.loads(self._body() or b"{}")
+                STORE._replication.set_known_leader_lsn(int(payload.get("leader_lsn", 0) or 0))
                 changes = payload.get("changes", [])
                 STORE._replication.apply_changes(changes)
                 self._json(
@@ -335,6 +369,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
                 if parts == ["ai", "cache"]:
+                    if settings.REPLICATION_ROLE == "follower":
+                        self._reject_readonly(route="POST /ai/cache")
+                        return
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
                     model = payload.get("model", "")
@@ -369,6 +406,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":
+                if settings.REPLICATION_ROLE == "follower":
+                    self._reject_readonly(route="POST /kv/incr/:key")
+                    return
                 key = parts[2]
                 delta = 1.0
                 ttl = None
@@ -397,6 +437,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /kv/incr/:key")
                 return
             if parts == ["kv", "batch"]:
+                if settings.REPLICATION_ROLE == "follower":
+                    self._reject_readonly(route="POST /kv/batch")
+                    return
                 payload = json.loads(self._body() or b"{}")
                 items = payload.get("items", {})
                 ttl = payload.get("ttl")
@@ -436,12 +479,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /admin")
             return
         if parts[0] == "health":
+            repl = STORE._replication.get_staleness() if settings.REPLICATION_ROLE == "follower" else None
             self._json(
                 200,
                 {
                     "status": "ok",
                     "uptime_seconds": time.time() - registry.get_all()["started_at"],
                     "shards": settings.SHARDS,
+                    "replication": repl,
                 },
             )
             self._inc_metrics("GET", route="GET /admin/health")

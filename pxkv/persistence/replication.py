@@ -68,6 +68,8 @@ class ReplicationManager:
         
         self.leader_addr = settings.REPLICATION_LEADER_ADDR
         self._last_applied_lsn = 0
+        self._last_applied_at = 0.0
+        self._known_leader_lsn = 0
 
     def start(self):
         if self.role == "leader":
@@ -88,6 +90,8 @@ class ReplicationManager:
                 lsn = int(data.pop("_lsn", 0) or 0)
                 self.store.load(data)
                 self._last_applied_lsn = lsn
+                self._last_applied_at = time.time()
+                self._known_leader_lsn = max(self._known_leader_lsn, lsn)
                 logging.info("Initial full sync completed successfully. LSN: %d", lsn)
                 return
             logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
@@ -99,6 +103,23 @@ class ReplicationManager:
 
     def stop(self):
         self._stop_event.set()
+
+    def set_known_leader_lsn(self, lsn: int) -> None:
+        self._known_leader_lsn = max(int(lsn or 0), self._known_leader_lsn)
+
+    def get_staleness(self) -> Dict[str, Any]:
+        now = time.time()
+        lag_lsn = max(0, int(self._known_leader_lsn) - int(self._last_applied_lsn))
+        age_ms = 0.0
+        if self._last_applied_at > 0:
+            age_ms = max(0.0, (now - float(self._last_applied_at)) * 1000.0)
+        return {
+            "role": self.role,
+            "last_applied_lsn": int(self._last_applied_lsn),
+            "known_leader_lsn": int(self._known_leader_lsn),
+            "lag_lsn": int(lag_lsn),
+            "last_applied_age_ms": float(age_ms),
+        }
 
     def enqueue_change(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None, lsn: int = 0):
         """Called by store when a change happens (Leader only)"""
@@ -138,8 +159,8 @@ class ReplicationManager:
 
                 for follower in self.followers:
                     url = f"http://{follower}/replication/sync"
-                    status, text = _http_post_json(url, {"changes": changes}, timeout=2.0)
                     leader_lsn = int(getattr(self.store._wal, "_lsn", 0) or 0)
+                    status, text = _http_post_json(url, {"changes": changes, "leader_lsn": leader_lsn}, timeout=2.0)
                     ack_lsn = self._follower_ack_lsn.get(follower, 0)
                     if status == 200:
                         try:
@@ -175,6 +196,7 @@ class ReplicationManager:
                 url = f"http://{self.leader_addr}/replication/wal?start_lsn={self._last_applied_lsn}"
                 status, data, _text = _http_get_json(url, timeout=2.0)
                 if status == 200 and isinstance(data, dict):
+                    self.set_known_leader_lsn(int(data.get("leader_lsn", 0) or 0))
                     changes = data.get("changes", [])
                     if isinstance(changes, list) and changes:
                         self.apply_changes(changes)
@@ -191,6 +213,7 @@ class ReplicationManager:
             
         changes.sort(key=lambda x: x.get("lsn", 0))
         
+        last_applied = False
         for change in changes:
             lsn = change.get("lsn", 0)
             if lsn <= self._last_applied_lsn:
@@ -220,5 +243,8 @@ class ReplicationManager:
                     self.store.incr(key, val, ttl, skip_replication=True)
                 
                 self._last_applied_lsn = lsn
+                last_applied = True
             except Exception as e:
                 logging.error("Follower failed to apply change LSN %d: %s", lsn, e)
+        if last_applied:
+            self._last_applied_at = time.time()

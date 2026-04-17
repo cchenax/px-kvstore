@@ -117,6 +117,17 @@ class RedisServer(threading.Thread):
         registry.inc_requests(f"REDIS_{cmd}")
         
         try:
+            if settings.REPLICATION_ROLE == "follower" and cmd in (
+                "SET",
+                "DEL",
+                "INCR",
+                "INCRBY",
+                "DECR",
+                "DECRBY",
+                "EXPIRE",
+                "FLUSHALL",
+            ):
+                return encode_error("READONLY You can't write against a read-only follower.")
             if cmd == "PING":
                 return encode_simple_string("PONG")
             

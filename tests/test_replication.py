@@ -44,6 +44,16 @@ def http_get_json(url: str) -> tuple[int, dict]:
         return int(getattr(e, "code", 500)), {}
 
 
+def http_get_json_with_headers(url: str) -> tuple[int, dict, dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            raw = resp.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            return resp.status, body, dict(resp.headers.items())
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 500)), {}, {}
+
+
 @pytest.fixture
 def leader_follower_cluster():
     leader_port = get_free_port()
@@ -88,9 +98,11 @@ def test_replication_basic(leader_follower_cluster):
     time.sleep(3.0)
     
     follower_url = f"http://localhost:{follower_port}/kv/repl_key"
-    status, body = http_get_json(follower_url)
+    status, body, headers = http_get_json_with_headers(follower_url)
     assert status == 200
     assert body["value"] == "repl_value"
+    assert headers.get("X-PXKV-Role") == "follower"
+    assert int(headers.get("X-PXKV-Replication-Last-Applied-LSN", "0")) > 0
 
 def test_replication_incr(leader_follower_cluster):
     leader_port, follower_port = leader_follower_cluster
@@ -209,3 +221,11 @@ def test_replication_ack_and_lag_metrics(leader_follower_cluster):
         time.sleep(0.5)
 
     raise AssertionError("replication ack metrics not updated in time")
+
+
+def test_follower_http_readonly_rejects_writes(leader_follower_cluster):
+    leader_port, follower_port = leader_follower_cluster
+    assert http_put(f"http://localhost:{leader_port}/kv/ro_seed", b"v1") in [201, 204]
+    time.sleep(1.0)
+    status = http_put(f"http://localhost:{follower_port}/kv/should_fail", b"nope")
+    assert status == 403

@@ -1,1 +1,1 @@
-{"lsn": 1, "op": "create", "key": "ack_probe", "value": "v1", "ttl": null}
+{"lsn": 1, "op": "create", "key": "repl_key", "value": "repl_value", "ttl": null}
