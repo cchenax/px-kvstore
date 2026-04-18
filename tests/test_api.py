@@ -3,6 +3,7 @@ import subprocess
 import time
 import json
 import urllib.request
+import gzip
 
 import pytest
 
@@ -53,3 +54,19 @@ def test_metrics_prometheus(http_server):
         text = resp.read().decode("utf-8", errors="replace")
     assert "pxkv_requests_total" in text
     assert "pxkv_replication_leader_lsn" in text
+
+
+def test_replication_snapshot_ndjson_gzip(http_server):
+    url = f"{http_server}/replication/snapshot?format=ndjson&compress=gzip"
+    req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"}, method="GET")
+    with urllib.request.urlopen(req, timeout=3.0) as resp:
+        assert resp.status == 200
+        raw = resp.read()
+        body = raw
+        if (resp.headers.get("Content-Encoding", "") or "").lower() == "gzip":
+            body = gzip.decompress(raw)
+    lines = body.decode("utf-8", errors="replace").splitlines()
+    assert len(lines) >= 1
+    meta = json.loads(lines[0])
+    assert "_lsn" in meta
+    assert "shards" in meta

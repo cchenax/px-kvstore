@@ -11,6 +11,7 @@ import time
 import urllib.parse as urlparse
 import uuid
 import random
+import gzip
 from typing import Any, Dict, Tuple, Optional
 
 from ..core.sharded import ShardedKeyValueStore
@@ -77,6 +78,7 @@ def _apply_runtime_config() -> None:
 
 class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     server_version = "PX-KVStore/2.0"
+    protocol_version = "HTTP/1.1"
 
     def _fault_sleep(self) -> None:
         if settings.FAULT_LATENCY_MS <= 0 and settings.FAULT_LATENCY_JITTER_MS <= 0:
@@ -152,6 +154,67 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._send(403, "READONLY You can't write against a read-only follower.", headers=self._staleness_headers())
         self._inc_metrics("WRITE", route=route, error=True)
 
+    def _send_snapshot_ndjson(self, compress: bool) -> None:
+        self._ensure_request_context()
+
+        def _default(v: Any):
+            if isinstance(v, (bytes, bytearray)):
+                return v.decode("utf-8", errors="replace")
+            raise TypeError
+
+        class _ChunkedWriter:
+            def __init__(self, wfile):
+                self.wfile = wfile
+
+            def write(self, b: Any) -> int:
+                if not b:
+                    return 0
+                if not isinstance(b, (bytes, bytearray)):
+                    b = str(b).encode("utf-8")
+                self.wfile.write(f"{len(b):X}\r\n".encode("utf-8"))
+                self.wfile.write(b)
+                self.wfile.write(b"\r\n")
+                return len(b)
+
+            def flush(self) -> None:
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+            def close(self) -> None:
+                self.flush()
+
+        self.send_response(200)
+        self.send_header("X-Request-Id", self._request_id)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        if compress:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        writer = _ChunkedWriter(self.wfile)
+        out: Any = writer
+        if compress:
+            out = gzip.GzipFile(fileobj=writer, mode="wb")
+
+        def _write_line(obj: Any) -> None:
+            line = (json.dumps(obj, default=_default, ensure_ascii=False) + "\n").encode("utf-8")
+            out.write(line)
+
+        lsn = int(getattr(STORE._wal, "_lsn", 0) or 0)
+        _write_line({"_lsn": lsn, "shards": settings.SHARDS})
+        for i, shard in enumerate(STORE._shards):
+            state = shard.dump_state()
+            _write_line({"shard": i, "state": state})
+
+        try:
+            if compress:
+                out.close()
+        finally:
+            writer.wfile.write(b"0\r\n\r\n")
+            writer.flush()
+
     def _inc_metrics(self, method: str, route: str = "", error: bool = False) -> None:
         registry.inc_requests(method, error)
         if route:
@@ -173,9 +236,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide snapshot")
                     return
-                data = STORE.dump()
-                data["_lsn"] = STORE._wal._lsn
-                self._json(200, data)
+                fmt = query.get("format", ["json"])[0]
+                compress = query.get("compress", [""])[0].lower() == "gzip"
+                if fmt == "ndjson":
+                    self._send_snapshot_ndjson(compress=compress)
+                else:
+                    data = STORE.dump()
+                    data["_lsn"] = STORE._wal._lsn
+                    self._json(200, data)
                 self._inc_metrics("GET", route="GET /replication/snapshot")
                 return
 

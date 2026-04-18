@@ -6,6 +6,7 @@ import threading
 import time
 import queue
 import json
+import gzip
 import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
@@ -84,17 +85,52 @@ class ReplicationManager:
         logging.info("Performing initial full sync from leader: %s", self.leader_addr)
         max_retries = 5
         for i in range(max_retries):
-            url = f"http://{self.leader_addr}/replication/snapshot"
-            status, data, text = _http_get_json(url, timeout=5.0)
-            if status == 200 and isinstance(data, dict):
-                lsn = int(data.pop("_lsn", 0) or 0)
-                self.store.load(data)
-                self._last_applied_lsn = lsn
-                self._last_applied_at = time.time()
-                self._known_leader_lsn = max(self._known_leader_lsn, lsn)
-                logging.info("Initial full sync completed successfully. LSN: %d", lsn)
-                return
-            logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
+            try:
+                url = f"http://{self.leader_addr}/replication/snapshot?format=ndjson&compress=gzip"
+                req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"}, method="GET")
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    if int(getattr(resp, "status", 0) or 0) != 200:
+                        raise RuntimeError(f"snapshot status={getattr(resp, 'status', 0)}")
+                    stream: Any = resp
+                    if (resp.headers.get("Content-Encoding", "") or "").lower() == "gzip":
+                        stream = gzip.GzipFile(fileobj=resp, mode="rb")
+                    first = stream.readline()
+                    if not first:
+                        raise RuntimeError("empty snapshot stream")
+                    meta = json.loads(first.decode("utf-8", errors="replace"))
+                    lsn = int(meta.get("_lsn", 0) or 0)
+                    while True:
+                        line = stream.readline()
+                        if not line:
+                            break
+                        rec = json.loads(line.decode("utf-8", errors="replace"))
+                        shard_idx = rec.get("shard")
+                        state = rec.get("state")
+                        if shard_idx is None or state is None:
+                            continue
+                        idx = int(shard_idx)
+                        if 0 <= idx < len(self.store._shards):
+                            self.store._shards[idx].load_state(state)
+                    self._last_applied_lsn = lsn
+                    self._last_applied_at = time.time()
+                    self._known_leader_lsn = max(self._known_leader_lsn, lsn)
+                    logging.info("Initial full sync completed successfully. LSN: %d", lsn)
+                    return
+            except Exception as e:
+                try:
+                    url = f"http://{self.leader_addr}/replication/snapshot"
+                    status, data, text = _http_get_json(url, timeout=5.0)
+                    if status == 200 and isinstance(data, dict):
+                        lsn = int(data.pop("_lsn", 0) or 0)
+                        self.store.load(data)
+                        self._last_applied_lsn = lsn
+                        self._last_applied_at = time.time()
+                        self._known_leader_lsn = max(self._known_leader_lsn, lsn)
+                        logging.info("Initial full sync completed successfully. LSN: %d", lsn)
+                        return
+                    logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
+                except Exception:
+                    logging.warning("Initial full sync attempt %d failed: %s", i + 1, e)
             
             if i < max_retries - 1:
                 time.sleep(2.0)
