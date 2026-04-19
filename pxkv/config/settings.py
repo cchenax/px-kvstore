@@ -33,6 +33,8 @@ class Settings:
             self.REDIS_PORT = int(os.getenv("PXKV_REDIS_PORT", "6379"))
             self.REDIS_ENABLED = os.getenv("PXKV_REDIS_ENABLED", "true").lower() == "true"
 
+            self.TIERING_DIR = os.getenv("PXKV_TIERING_DIR", "")
+
             self.REPLICATION_ROLE = os.getenv("PXKV_REPLICATION_ROLE", "leader").lower()
             self.REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
             self.REPLICATION_FOLLOWERS = [f for f in os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") if f]

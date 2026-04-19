@@ -1,8 +1,10 @@
 import pytest
 import time
+import tempfile
 from pxkv.core.lru import LRUKeyValueStore
 from pxkv.core.lfu import LFUKeyValueStore
 from pxkv.core.sharded import ShardedKeyValueStore
+from pxkv.tiering.file import FileTieringBackend
 
 @pytest.fixture
 def lru_store():
@@ -84,3 +86,21 @@ class TestShardedStore:
         assert sharded_store.incr("counter", 1) == 1.0
         assert sharded_store.incr("counter", 5.5) == 6.5
         assert sharded_store.read("counter") == 6.5
+
+
+def test_tiering_spill_and_promote_lru():
+    with tempfile.TemporaryDirectory() as d:
+        tiering = FileTieringBackend(d)
+        s = LRUKeyValueStore(max_size=1, tiering=tiering)
+        s.create("a", "va")
+        s.create("b", "vb")
+        assert s.read("a") == "va"
+
+
+def test_tiering_spill_and_promote_lfu():
+    with tempfile.TemporaryDirectory() as d:
+        tiering = FileTieringBackend(d)
+        s = LFUKeyValueStore(max_size=1, tiering=tiering)
+        s.create("a", "va")
+        s.create("b", "vb")
+        assert s.read("a") == "va"

@@ -28,7 +28,8 @@ STORE = ShardedKeyValueStore(
     shards=settings.SHARDS,
     per_shard_max=settings.PER_SHARD_MAX,
     eviction_policy=settings.EVICTION_POLICY,
-    wal_path=settings.WAL_FILE
+    wal_path=settings.WAL_FILE,
+    tiering_dir=settings.TIERING_DIR,
 )
 
 _EXPIRER = BackgroundExpirer(STORE, interval=60.0)

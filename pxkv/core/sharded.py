@@ -11,21 +11,31 @@ from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
+from ..tiering.file import FileTieringBackend
 
 class ShardedKeyValueStore(object):
     """
     Sharding wrapper using consistent hashing with virtual nodes.
     """
 
-    def __init__(self, shards: int = 4, per_shard_max: int = 1000, eviction_policy: str = "lru", vnodes: int = 100, wal_path: str = ""):
+    def __init__(
+        self,
+        shards: int = 4,
+        per_shard_max: int = 1000,
+        eviction_policy: str = "lru",
+        vnodes: int = 100,
+        wal_path: str = "",
+        tiering_dir: str = "",
+    ):
         if shards < 1:
             raise ValueError("shards must be >= 1")
         self._num = shards
         policy = (eviction_policy or "lru").strip().lower()
+        tiering = FileTieringBackend(tiering_dir) if tiering_dir else None
         if policy == "lfu":
-            factory = lambda: LFUKeyValueStore(per_shard_max)
+            factory = lambda: LFUKeyValueStore(per_shard_max, tiering=tiering)
         elif policy == "lru":
-            factory = lambda: LRUKeyValueStore(per_shard_max)
+            factory = lambda: LRUKeyValueStore(per_shard_max, tiering=tiering)
         else:
             raise ValueError(f"unknown eviction_policy: {eviction_policy!r}")
         self._eviction_policy = policy

@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from threading import Lock
 from .base import _SortedStringKeyIndex
+from ..tiering.base import TieringBackend
 
 class _Node(object):
     def __init__(self, key: Any, value: Any):
@@ -18,12 +19,13 @@ class LRUKeyValueStore(object):
     Thread-safe in-memory LRU key-value store with optional TTL per key.
     """
 
-    def __init__(self, max_size: Optional[int] = None):
+    def __init__(self, max_size: Optional[int] = None, tiering: Optional[TieringBackend] = None):
         self._lock = Lock()
         self._max = max_size
         self._map: Dict[Any, _Node] = {}
         self._ttl: Dict[Any, Optional[float]] = {}
         self._skeys = _SortedStringKeyIndex()
+        self._tiering = tiering
 
         self._head = _Node(None, None)
         self._tail = _Node(None, None)
@@ -66,6 +68,15 @@ class LRUKeyValueStore(object):
             lru = self._head.next
             if lru is None:
                 break
+            if self._tiering is not None and lru.key is not None:
+                now = time.time()
+                ts = self._ttl.get(lru.key)
+                ttl_remaining = None if ts is None else max(0.0, ts - now)
+                if ttl_remaining is None or ttl_remaining > 0:
+                    try:
+                        self._tiering.put(lru.key, lru.value, ttl_remaining)
+                    except Exception:
+                        pass
             self._delete(lru.key)
 
     def _delete(self, key: Any) -> None:
@@ -84,6 +95,11 @@ class LRUKeyValueStore(object):
             self._purge_expired()
             if key in self._map:
                 raise KeyError(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             node = _Node(key, value)
             self._map[key] = node
             self._append(node)
@@ -101,7 +117,27 @@ class LRUKeyValueStore(object):
             self._purge_expired()
             node = self._map.get(key)
             if node is None:
-                raise KeyError(key)
+                if self._tiering is None:
+                    raise KeyError(key)
+                try:
+                    hit = self._tiering.get(key)
+                except Exception:
+                    hit = None
+                if hit is None:
+                    raise KeyError(key)
+                node = _Node(key, hit.value)
+                self._map[key] = node
+                self._append(node)
+                self._skeys.add(key)
+                if hit.ttl_remaining is None:
+                    self._ttl[key] = None
+                else:
+                    self._ttl[key] = time.time() + float(hit.ttl_remaining)
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
+                self._evict_if_needed()
             self._move_to_tail(node)
             return node.value
 
@@ -111,6 +147,11 @@ class LRUKeyValueStore(object):
             node = self._map.get(key)
             if node is None:
                 raise KeyError(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             node.value = value
             self._move_to_tail(node)
             if ttl is not None:
@@ -122,11 +163,21 @@ class LRUKeyValueStore(object):
             if key not in self._map:
                 raise KeyError(key)
             self._delete(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
 
     def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None) -> None:
         with self._lock:
             self._purge_expired()
             for k, v in items.items():
+                if self._tiering is not None:
+                    try:
+                        self._tiering.delete(k)
+                    except Exception:
+                        pass
                 node = self._map.get(k)
                 if node:
                     node.value = v
@@ -149,6 +200,25 @@ class LRUKeyValueStore(object):
             out: Dict[Any, Any] = {}
             for k in keys:
                 node = self._map.get(k)
+                if node is None and self._tiering is not None:
+                    try:
+                        hit = self._tiering.get(k)
+                    except Exception:
+                        hit = None
+                    if hit is not None:
+                        node = _Node(k, hit.value)
+                        self._map[k] = node
+                        self._append(node)
+                        self._skeys.add(k)
+                        if hit.ttl_remaining is None:
+                            self._ttl[k] = None
+                        else:
+                            self._ttl[k] = time.time() + float(hit.ttl_remaining)
+                        try:
+                            self._tiering.delete(k)
+                        except Exception:
+                            pass
+                        self._evict_if_needed()
                 if node:
                     self._move_to_tail(node)
                     out[k] = node.value
@@ -157,6 +227,11 @@ class LRUKeyValueStore(object):
     def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None) -> float:
         with self._lock:
             self._purge_expired()
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             node = self._map.get(key)
             if node is None:
                 current = 0.0

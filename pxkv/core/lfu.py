@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 from threading import Lock
 from .base import _SortedStringKeyIndex
+from ..tiering.base import TieringBackend
 
 class LFUKeyValueStore(object):
     """
@@ -14,7 +15,7 @@ class LFUKeyValueStore(object):
     This is intentionally simple (O(n) eviction) to keep code small and predictable.
     """
 
-    def __init__(self, max_size: Optional[int] = None):
+    def __init__(self, max_size: Optional[int] = None, tiering: Optional[TieringBackend] = None):
         self._lock = Lock()
         self._max = max_size
         self._map: Dict[Any, Any] = {}
@@ -23,6 +24,7 @@ class LFUKeyValueStore(object):
         self._seq: int = 0
         self._last: Dict[Any, int] = {}
         self._skeys = _SortedStringKeyIndex()
+        self._tiering = tiering
 
     def _touch(self, key: Any) -> None:
         self._seq += 1
@@ -56,6 +58,15 @@ class LFUKeyValueStore(object):
                     victim = k
             if victim is None:
                 break
+            if self._tiering is not None:
+                now = time.time()
+                ts = self._ttl.get(victim)
+                ttl_remaining = None if ts is None else max(0.0, ts - now)
+                if ttl_remaining is None or ttl_remaining > 0:
+                    try:
+                        self._tiering.put(victim, self._map.get(victim), ttl_remaining)
+                    except Exception:
+                        pass
             self._delete(victim)
 
     def purge_expired(self) -> None:
@@ -67,6 +78,11 @@ class LFUKeyValueStore(object):
             self._purge_expired()
             if key in self._map:
                 raise KeyError(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             self._map[key] = value
             self._skeys.add(key)
             if ttl is not None:
@@ -80,7 +96,26 @@ class LFUKeyValueStore(object):
         with self._lock:
             self._purge_expired()
             if key not in self._map:
-                raise KeyError(key)
+                if self._tiering is None:
+                    raise KeyError(key)
+                try:
+                    hit = self._tiering.get(key)
+                except Exception:
+                    hit = None
+                if hit is None:
+                    raise KeyError(key)
+                self._map[key] = hit.value
+                self._skeys.add(key)
+                if hit.ttl_remaining is None:
+                    self._ttl[key] = None
+                else:
+                    self._ttl[key] = time.time() + float(hit.ttl_remaining)
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
+                self._touch(key)
+                self._evict_if_needed()
             self._touch(key)
             return self._map[key]
 
@@ -89,6 +124,11 @@ class LFUKeyValueStore(object):
             self._purge_expired()
             if key not in self._map:
                 raise KeyError(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             self._map[key] = value
             if ttl is not None:
                 self._ttl[key] = time.time() + ttl
@@ -100,11 +140,21 @@ class LFUKeyValueStore(object):
             if key not in self._map:
                 raise KeyError(key)
             self._delete(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
 
     def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None) -> None:
         with self._lock:
             self._purge_expired()
             for k, v in items.items():
+                if self._tiering is not None:
+                    try:
+                        self._tiering.delete(k)
+                    except Exception:
+                        pass
                 if k in self._map:
                     self._map[k] = v
                 else:
@@ -122,6 +172,24 @@ class LFUKeyValueStore(object):
             self._purge_expired()
             out: Dict[Any, Any] = {}
             for k in keys:
+                if k not in self._map and self._tiering is not None:
+                    try:
+                        hit = self._tiering.get(k)
+                    except Exception:
+                        hit = None
+                    if hit is not None:
+                        self._map[k] = hit.value
+                        self._skeys.add(k)
+                        if hit.ttl_remaining is None:
+                            self._ttl[k] = None
+                        else:
+                            self._ttl[k] = time.time() + float(hit.ttl_remaining)
+                        try:
+                            self._tiering.delete(k)
+                        except Exception:
+                            pass
+                        self._touch(k)
+                        self._evict_if_needed()
                 if k in self._map:
                     self._touch(k)
                     out[k] = self._map[k]
@@ -130,6 +198,11 @@ class LFUKeyValueStore(object):
     def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None) -> float:
         with self._lock:
             self._purge_expired()
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
             if key not in self._map:
                 current = 0.0
             else:
