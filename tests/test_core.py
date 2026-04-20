@@ -87,6 +87,11 @@ class TestShardedStore:
         assert sharded_store.incr("counter", 5.5) == 6.5
         assert sharded_store.read("counter") == 6.5
 
+    def test_hash_tag_routing(self, sharded_store):
+        k1 = "user:{42}:profile"
+        k2 = "user:{42}:settings"
+        assert sharded_store.shard_for_key(k1) == sharded_store.shard_for_key(k2)
+
 
 def test_tiering_spill_and_promote_lru():
     with tempfile.TemporaryDirectory() as d:

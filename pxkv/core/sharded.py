@@ -52,15 +52,32 @@ class ShardedKeyValueStore(object):
         self._wal = WAL(wal_path)
         self._replication = ReplicationManager(self)
 
+    def _hash_key_material(self, key: Any) -> bytes:
+        if isinstance(key, bytes):
+            raw = key
+        elif isinstance(key, str):
+            raw = key.encode("utf-8", errors="replace")
+        else:
+            raw = str(key).encode("utf-8", errors="replace")
+
+        l = raw.find(b"{")
+        if l != -1:
+            r = raw.find(b"}", l + 1)
+            if r != -1 and r > l + 1:
+                return raw[l + 1 : r]
+        return raw
+
     def _idx(self, key: Any) -> int:
-        if isinstance(key, str):
-            key = key.encode("utf-8")
-        h = binascii.crc32(key)
+        material = self._hash_key_material(key)
+        h = binascii.crc32(material)
 
         idx = bisect.bisect_left(self._ring, (h, 0))
         if idx == len(self._ring):
             idx = 0
         return self._ring[idx][1]
+
+    def shard_for_key(self, key: Any) -> int:
+        return self._idx(key)
 
     def _bucket(self, key: Any):
         return self._shards[self._idx(key)]
