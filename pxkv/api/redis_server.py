@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 
 from ..metrics.registry import registry
 from ..config.settings import settings
+from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, role_satisfies
 
 def encode_simple_string(s: str) -> bytes:
     return f"+{s}\r\n".encode("utf-8")
@@ -80,6 +81,7 @@ class RedisServer(threading.Thread):
     def handle_client(self, conn, addr):
         logging.info("Redis client connected from %s", addr)
         f = conn.makefile("rb")
+        role: Optional[str] = None
         try:
             while not self._stop_event.is_set():
                 line = f.readline()
@@ -103,7 +105,7 @@ class RedisServer(threading.Thread):
                 if not args:
                     continue
                 
-                response = self.handle_command(args)
+                response, role = self.handle_command(args, role)
                 conn.sendall(response)
         except Exception as e:
             logging.debug("Redis client error: %s", e)
@@ -111,7 +113,39 @@ class RedisServer(threading.Thread):
             conn.close()
             logging.info("Redis client disconnected from %s", addr)
 
-    def handle_command(self, args: List[bytes]) -> bytes:
+    def _auth_enabled(self) -> bool:
+        return any(
+            [
+                settings.AUTH_ADMIN_TOKEN,
+                settings.AUTH_WRITER_TOKEN,
+                settings.AUTH_READER_TOKEN,
+                settings.AUTH_ADMIN_PASSWORD,
+                settings.AUTH_WRITER_PASSWORD,
+                settings.AUTH_READER_PASSWORD,
+            ]
+        )
+
+    def _role_for_secret(self, secret: str) -> Optional[str]:
+        return best_role_for_secret(
+            secret,
+            admin_token=settings.AUTH_ADMIN_TOKEN,
+            writer_token=settings.AUTH_WRITER_TOKEN,
+            reader_token=settings.AUTH_READER_TOKEN,
+            admin_password=settings.AUTH_ADMIN_PASSWORD,
+            writer_password=settings.AUTH_WRITER_PASSWORD,
+            reader_password=settings.AUTH_READER_PASSWORD,
+        )
+
+    def _required_role_for_cmd(self, cmd: str) -> str:
+        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE"):
+            return ROLE_READER
+        if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "FLUSHALL"):
+            return ROLE_WRITER
+        if cmd == "AUTH":
+            return ROLE_READER
+        return ROLE_ADMIN
+
+    def handle_command(self, args: List[bytes], role: Optional[str]) -> tuple[bytes, Optional[str]]:
         cmd = args[0].decode("utf-8").upper()
         start_time = time.time()
         registry.inc_requests(f"REDIS_{cmd}")
@@ -127,13 +161,30 @@ class RedisServer(threading.Thread):
                 "EXPIRE",
                 "FLUSHALL",
             ):
-                return encode_error("READONLY You can't write against a read-only follower.")
+                return encode_error("READONLY You can't write against a read-only follower."), role
+
+            if self._auth_enabled() and cmd != "AUTH":
+                if role is None:
+                    return encode_error("NOAUTH Authentication required."), role
+                required = self._required_role_for_cmd(cmd)
+                if not role_satisfies(role, required):
+                    return encode_error("NOPERM this user has no permissions to run the command"), role
+
+            if cmd == "AUTH":
+                if len(args) not in (2, 3):
+                    return encode_error("ERR wrong number of arguments for 'AUTH' command"), role
+                secret = args[-1].decode("utf-8", errors="replace")
+                new_role = self._role_for_secret(secret) if self._auth_enabled() else ROLE_ADMIN
+                if new_role is None:
+                    return encode_error("ERR invalid password"), role
+                return encode_simple_string("OK"), new_role
+
             if cmd == "PING":
-                return encode_simple_string("PONG")
+                return encode_simple_string("PONG"), role
             
             elif cmd == "SET":
                 if len(args) < 3:
-                    return encode_error("ERR wrong number of arguments for 'SET' command")
+                    return encode_error("ERR wrong number of arguments for 'SET' command"), role
                 key = args[1].decode("utf-8")
                 val = args[2].decode("utf-8")
                 ttl = None
@@ -154,21 +205,21 @@ class RedisServer(threading.Thread):
                     self.store.update(key, val, ttl)
                 except KeyError:
                     self.store.create(key, val, ttl)
-                return encode_simple_string("OK")
+                return encode_simple_string("OK"), role
             
             elif cmd == "GET":
                 if len(args) != 2:
-                    return encode_error("ERR wrong number of arguments for 'GET' command")
+                    return encode_error("ERR wrong number of arguments for 'GET' command"), role
                 key = args[1].decode("utf-8")
                 try:
                     val = self.store.read(key)
-                    return encode_bulk_string(val)
+                    return encode_bulk_string(val), role
                 except KeyError:
-                    return encode_bulk_string(None)
+                    return encode_bulk_string(None), role
             
             elif cmd == "DEL":
                 if len(args) < 2:
-                    return encode_error("ERR wrong number of arguments for 'DEL' command")
+                    return encode_error("ERR wrong number of arguments for 'DEL' command"), role
                 count = 0
                 for i in range(1, len(args)):
                     key = args[i].decode("utf-8")
@@ -177,11 +228,11 @@ class RedisServer(threading.Thread):
                         count += 1
                     except KeyError:
                         pass
-                return encode_integer(count)
+                return encode_integer(count), role
             
             elif cmd == "EXISTS":
                 if len(args) < 2:
-                    return encode_error("ERR wrong number of arguments for 'EXISTS' command")
+                    return encode_error("ERR wrong number of arguments for 'EXISTS' command"), role
                 count = 0
                 for i in range(1, len(args)):
                     key = args[i].decode("utf-8")
@@ -190,50 +241,50 @@ class RedisServer(threading.Thread):
                         count += 1
                     except KeyError:
                         pass
-                return encode_integer(count)
+                return encode_integer(count), role
 
             elif cmd in ("INCR", "INCRBY", "DECR", "DECRBY"):
                 if len(args) < 2:
-                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command")
+                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role
                 key = args[1].decode("utf-8")
                 delta = 1.0
                 if cmd == "INCRBY":
                     if len(args) != 3:
-                        return encode_error("ERR wrong number of arguments for 'INCRBY' command")
+                        return encode_error("ERR wrong number of arguments for 'INCRBY' command"), role
                     delta = float(args[2].decode("utf-8"))
                 elif cmd == "DECR":
                     delta = -1.0
                 elif cmd == "DECRBY":
                     if len(args) != 3:
-                        return encode_error("ERR wrong number of arguments for 'DECRBY' command")
+                        return encode_error("ERR wrong number of arguments for 'DECRBY' command"), role
                     delta = -float(args[2].decode("utf-8"))
                 
                 try:
                     new_val = self.store.incr(key, delta)
-                    return encode_integer(int(new_val))
+                    return encode_integer(int(new_val)), role
                 except TypeError:
-                    return encode_error("ERR value is not an integer or out of range")
+                    return encode_error("ERR value is not an integer or out of range"), role
             
             elif cmd == "EXPIRE":
                 if len(args) != 3:
-                    return encode_error("ERR wrong number of arguments for 'EXPIRE' command")
+                    return encode_error("ERR wrong number of arguments for 'EXPIRE' command"), role
                 key = args[1].decode("utf-8")
                 ttl = float(args[2].decode("utf-8"))
                 try:
                     val = self.store.read(key)
                     self.store.update(key, val, ttl)
-                    return encode_integer(1)
+                    return encode_integer(1), role
                 except KeyError:
-                    return encode_integer(0)
+                    return encode_integer(0), role
 
             elif cmd == "INFO":
                 uptime = int(time.time() - registry.get_all()["started_at"])
                 info = f"redis_version:2.0\r\nuptime_in_seconds:{uptime}\r\n"
                 info += f"shards:{settings.SHARDS}\r\n"
-                return encode_bulk_string(info)
+                return encode_bulk_string(info), role
 
             elif cmd == "DBSIZE":
-                return encode_integer(len(self.store.keys()))
+                return encode_integer(len(self.store.keys())), role
 
             elif cmd == "FLUSHALL":
                 for shard in self.store._shards:
@@ -242,10 +293,10 @@ class RedisServer(threading.Thread):
                         shard._ttl.clear()
                         if hasattr(shard, '_skeys'):
                             shard._skeys.clear()
-                return encode_simple_string("OK")
+                return encode_simple_string("OK"), role
 
             else:
-                return encode_error(f"ERR unknown command '{cmd}'")
+                return encode_error(f"ERR unknown command '{cmd}'"), role
         
         finally:
             elapsed_ms = (time.time() - start_time) * 1000.0

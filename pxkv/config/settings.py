@@ -35,6 +35,13 @@ class Settings:
 
             self.TIERING_DIR = os.getenv("PXKV_TIERING_DIR", "")
 
+            self.AUTH_ADMIN_TOKEN = os.getenv("PXKV_AUTH_ADMIN_TOKEN", "")
+            self.AUTH_WRITER_TOKEN = os.getenv("PXKV_AUTH_WRITER_TOKEN", "")
+            self.AUTH_READER_TOKEN = os.getenv("PXKV_AUTH_READER_TOKEN", "")
+            self.AUTH_ADMIN_PASSWORD = os.getenv("PXKV_AUTH_ADMIN_PASSWORD", "")
+            self.AUTH_WRITER_PASSWORD = os.getenv("PXKV_AUTH_WRITER_PASSWORD", "")
+            self.AUTH_READER_PASSWORD = os.getenv("PXKV_AUTH_READER_PASSWORD", "")
+
             self.REPLICATION_ROLE = os.getenv("PXKV_REPLICATION_ROLE", "leader").lower()
             self.REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
             self.REPLICATION_FOLLOWERS = [f for f in os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") if f]

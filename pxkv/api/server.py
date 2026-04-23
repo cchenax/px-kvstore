@@ -23,6 +23,7 @@ from ..metrics.prometheus import registry_to_prometheus
 from ..core.expiration import BackgroundExpirer
 from ..config.settings import settings
 from ..api.redis_server import RedisServer
+from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 
 STORE = ShardedKeyValueStore(
     shards=settings.SHARDS,
@@ -119,6 +120,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             body = str(body).encode("utf-8")
         self.send_response(code)
         self.send_header("X-Request-Id", self._request_id)
+        self.send_header("Connection", "close")
         if headers:
             for k, v in headers.items():
                 if v is None:
@@ -155,6 +157,71 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._send(403, "READONLY You can't write against a read-only follower.", headers=self._staleness_headers())
         self._inc_metrics("WRITE", route=route, error=True)
 
+    def _auth_enabled(self) -> bool:
+        return any(
+            [
+                settings.AUTH_ADMIN_TOKEN,
+                settings.AUTH_WRITER_TOKEN,
+                settings.AUTH_READER_TOKEN,
+                settings.AUTH_ADMIN_PASSWORD,
+                settings.AUTH_WRITER_PASSWORD,
+                settings.AUTH_READER_PASSWORD,
+            ]
+        )
+
+    def _auth_role(self) -> Optional[str]:
+        authorization = self.headers.get("Authorization", "") or ""
+        token = parse_bearer(authorization) or (self.headers.get("X-Auth-Token", "") or "")
+        password = parse_basic_password(authorization) or (self.headers.get("X-Auth-Password", "") or "")
+
+        if token:
+            role = best_role_for_secret(
+                token,
+                admin_token=settings.AUTH_ADMIN_TOKEN,
+                writer_token=settings.AUTH_WRITER_TOKEN,
+                reader_token=settings.AUTH_READER_TOKEN,
+                admin_password=settings.AUTH_ADMIN_PASSWORD,
+                writer_password=settings.AUTH_WRITER_PASSWORD,
+                reader_password=settings.AUTH_READER_PASSWORD,
+            )
+            if role:
+                return role
+
+        if password:
+            role = best_role_for_secret(
+                password,
+                admin_token=settings.AUTH_ADMIN_TOKEN,
+                writer_token=settings.AUTH_WRITER_TOKEN,
+                reader_token=settings.AUTH_READER_TOKEN,
+                admin_password=settings.AUTH_ADMIN_PASSWORD,
+                writer_password=settings.AUTH_WRITER_PASSWORD,
+                reader_password=settings.AUTH_READER_PASSWORD,
+            )
+            if role:
+                return role
+
+        return None
+
+    def _require_role(self, required: str) -> bool:
+        if not self._auth_enabled():
+            return True
+        role = self._auth_role()
+        if role is None:
+            self._send(
+                401,
+                "Unauthorized",
+                headers={
+                    "WWW-Authenticate": 'Bearer realm="pxkv", charset="UTF-8"',
+                },
+            )
+            self._inc_metrics("AUTH", route="AUTH (missing)", error=True)
+            return False
+        if not role_satisfies(role, required):
+            self._send(403, "Forbidden")
+            self._inc_metrics("AUTH", route="AUTH (forbidden)", error=True)
+            return False
+        return True
+
     def _send_snapshot_ndjson(self, compress: bool) -> None:
         self._ensure_request_context()
 
@@ -188,6 +255,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("X-Request-Id", self._request_id)
+        self.send_header("Connection", "close")
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         if compress:
             self.send_header("Content-Encoding", "gzip")
@@ -234,6 +302,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["replication", "snapshot"]:
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide snapshot")
                     return
@@ -249,6 +319,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["replication", "wal"]:
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 if settings.REPLICATION_ROLE != "leader":
                     self._send(403, "Only leader can provide WAL")
                     return
@@ -264,10 +336,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts[0] == "admin":
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 self._handle_admin_get(parts[1:], query)
                 return
 
             if parts[0] == "ai":
+                if not self._require_role(ROLE_READER):
+                    return
                 if len(parts) >= 2 and parts[1] == "cache":
                     if len(parts) != 3 or not parts[2]:
                         raise ValueError
@@ -282,6 +358,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if parts[0] != "kv":
                 raise ValueError
 
+            if not self._require_role(ROLE_READER):
+                return
             if len(parts) >= 2 and parts[1] == "batch":
                 if "keys" not in query:
                     self._send(400, "keys query param required")
@@ -334,6 +412,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if not self._require_role(ROLE_WRITER):
+                return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="PUT /kv/:key")
                 return
@@ -368,6 +448,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if not self._require_role(ROLE_WRITER):
+                return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="DELETE /kv/:key")
                 return
@@ -392,6 +474,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             parts, _ = self._parse()
             
             if parts == ["replication", "sync"]:
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 if settings.REPLICATION_ROLE != "follower":
                     self._send(403, "Only followers can receive sync")
                     return
@@ -412,6 +496,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if len(parts) >= 1 and parts[0] == "ai":
                 if parts == ["ai", "cache", "lookup"]:
+                    if not self._require_role(ROLE_READER):
+                        return
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
                     model = payload.get("model", "")
@@ -438,6 +524,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
                 if parts == ["ai", "cache"]:
+                    if not self._require_role(ROLE_WRITER):
+                        return
                     if settings.REPLICATION_ROLE == "follower":
                         self._reject_readonly(route="POST /ai/cache")
                         return
@@ -475,6 +563,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":
+                if not self._require_role(ROLE_WRITER):
+                    return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/incr/:key")
                     return
@@ -506,6 +596,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /kv/incr/:key")
                 return
             if parts == ["kv", "batch"]:
+                if not self._require_role(ROLE_WRITER):
+                    return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/batch")
                     return
@@ -522,6 +614,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["admin", "config"]:
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 payload = json.loads(self._body() or b"{}")
                 settings.update(payload)
                 _apply_runtime_config()
@@ -530,6 +624,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["admin", "config", "reload"]:
+                if not self._require_role(ROLE_ADMIN):
+                    return
                 settings.reload()
                 _apply_runtime_config()
                 self._json(200, {"status": "ok", "config": settings.to_dict()})
