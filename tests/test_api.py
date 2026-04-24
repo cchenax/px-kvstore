@@ -15,6 +15,25 @@ def get_free_port() -> int:
         s.bind(("", 0))
         return s.getsockname()[1]
 
+def stop_proc(proc: subprocess.Popen) -> None:
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=3.0)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=3.0)
+    except Exception:
+        pass
+
 
 @pytest.fixture
 def http_server():
@@ -36,8 +55,7 @@ def http_server():
         except Exception:
             time.sleep(0.2)
     yield base
-    proc.terminate()
-    proc.wait()
+    stop_proc(proc)
 
 
 def test_admin_health(http_server):

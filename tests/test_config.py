@@ -14,6 +14,25 @@ def get_free_port() -> int:
         s.bind(("", 0))
         return s.getsockname()[1]
 
+def stop_proc(proc: subprocess.Popen) -> None:
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=3.0)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=3.0)
+    except Exception:
+        pass
+
 
 @pytest.fixture
 def server(tmp_path):
@@ -25,12 +44,30 @@ def server(tmp_path):
     env["PXKV_PORT"] = str(port)
     env["PXKV_REDIS_ENABLED"] = "false"
     env["PXKV_CONFIG_FILE"] = str(config_file)
+    env["PXKV_WAL_FILE"] = ""
+    env["PXKV_SNAPSHOT_FILE"] = ""
+    env["PXKV_SNAPSHOT_INTERVAL"] = "0"
+    env["PXKV_REPLICATION_ROLE"] = "leader"
+    env["PXKV_REPLICATION_FOLLOWERS"] = ""
+    env["PXKV_AUTH_ADMIN_TOKEN"] = ""
+    env["PXKV_AUTH_WRITER_TOKEN"] = ""
+    env["PXKV_AUTH_READER_TOKEN"] = ""
+    env["PXKV_AUTH_ADMIN_PASSWORD"] = ""
+    env["PXKV_AUTH_WRITER_PASSWORD"] = ""
+    env["PXKV_AUTH_READER_PASSWORD"] = ""
 
     proc = subprocess.Popen(["python3", "server.py"], env=env)
-    time.sleep(2.0)
-    yield f"http://localhost:{port}", proc, config_file
-    proc.terminate()
-    proc.wait()
+    base = f"http://localhost:{port}"
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            time.sleep(0.2)
+    yield base, proc, config_file
+    stop_proc(proc)
 
 
 def test_config_hot_reload_api(server):
