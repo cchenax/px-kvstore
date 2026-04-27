@@ -42,6 +42,11 @@ class Settings:
             self.AUTH_WRITER_PASSWORD = os.getenv("PXKV_AUTH_WRITER_PASSWORD", "")
             self.AUTH_READER_PASSWORD = os.getenv("PXKV_AUTH_READER_PASSWORD", "")
 
+            self.FOLLOWER_READ_ENABLED = os.getenv("PXKV_FOLLOWER_READ_ENABLED", "false").lower() == "true"
+            self.FOLLOWER_READ_MAX_LAG_LSN = int(os.getenv("PXKV_FOLLOWER_READ_MAX_LAG_LSN", "0") or "0")
+            self.FOLLOWER_READ_MAX_AGE_MS = float(os.getenv("PXKV_FOLLOWER_READ_MAX_AGE_MS", "0") or "0")
+            self.FOLLOWER_READ_STRATEGY = os.getenv("PXKV_FOLLOWER_READ_STRATEGY", "least_lag").lower()
+
             self.REPLICATION_ROLE = os.getenv("PXKV_REPLICATION_ROLE", "leader").lower()
             self.REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
             self.REPLICATION_FOLLOWERS = [f for f in os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") if f]

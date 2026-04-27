@@ -9,6 +9,8 @@ import signal
 import sys
 import time
 import urllib.parse as urlparse
+import urllib.request
+import urllib.error
 import uuid
 import random
 import gzip
@@ -222,6 +224,141 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return False
         return True
 
+    def _follower_read_routing_enabled(self) -> bool:
+        return settings.REPLICATION_ROLE == "leader" and settings.FOLLOWER_READ_ENABLED and bool(STORE._replication.followers)
+
+    def _parse_int(self, s: Any, default: int) -> int:
+        try:
+            return int(s)
+        except Exception:
+            return int(default)
+
+    def _parse_float(self, s: Any, default: float) -> float:
+        try:
+            return float(s)
+        except Exception:
+            return float(default)
+
+    def _select_follower_for_read(self) -> Optional[str]:
+        followers = list(STORE._replication.followers or [])
+        if not followers:
+            return None
+
+        strategy = (settings.FOLLOWER_READ_STRATEGY or "").lower()
+        if strategy == "random":
+            return random.choice(followers)
+
+        metrics = registry.get_all().get("replication", {}).get("followers", {}) or {}
+        best = None
+        best_lag = None
+        for f in followers:
+            try:
+                lag = int((metrics.get(f, {}) or {}).get("lag_lsn", 0) or 0)
+            except Exception:
+                continue
+            if best is None or (best_lag is not None and lag < best_lag):
+                best = f
+                best_lag = lag
+        return best or random.choice(followers)
+
+    def _forward_auth_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        for k in ("Authorization", "X-Auth-Token", "X-Auth-Password"):
+            v = self.headers.get(k)
+            if v:
+                headers[k] = v
+        return headers
+
+    def _http_get_bytes(self, url: str, headers: Dict[str, str], timeout: float) -> tuple[int, bytes, Dict[str, str]]:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                body = resp.read()
+                return status, body, dict(resp.headers.items())
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except Exception:
+                body = b""
+            return int(getattr(e, "code", 500)), body, dict(getattr(e, "headers", {}) or {})
+        except Exception:
+            return 0, b"", {}
+
+    def _staleness_ok(self, hdrs: Dict[str, str], max_lag_lsn: int, max_age_ms: float) -> bool:
+        lag = self._parse_int(hdrs.get("X-PXKV-Replication-Lag-LSN", "0"), 0)
+        age = self._parse_float(hdrs.get("X-PXKV-Replication-Last-Applied-Age-MS", "0"), 0.0)
+        if max_lag_lsn > 0 and lag > max_lag_lsn:
+            return False
+        if max_age_ms > 0 and age > max_age_ms:
+            return False
+        return True
+
+    def _maybe_route_read_to_follower(self, parts: list[str], query: Dict[str, list[str]]) -> bool:
+        if not self._follower_read_routing_enabled():
+            return False
+        if self.headers.get("X-PXKV-Proxy", "") == "1":
+            return False
+        if not parts or parts[0] != "kv":
+            return False
+
+        read_from = (query.get("read_from", [""])[0] or "").lower()
+        if read_from == "leader":
+            return False
+        if read_from not in ("", "auto", "follower"):
+            return False
+
+        follower = self._select_follower_for_read()
+        if not follower:
+            return False
+
+        max_lag_lsn = self._parse_int(query.get("max_lag_lsn", [settings.FOLLOWER_READ_MAX_LAG_LSN])[0], settings.FOLLOWER_READ_MAX_LAG_LSN)
+        max_age_ms = self._parse_float(query.get("max_age_ms", [settings.FOLLOWER_READ_MAX_AGE_MS])[0], settings.FOLLOWER_READ_MAX_AGE_MS)
+
+        upstream_headers = {"X-PXKV-Proxy": "1"}
+        upstream_headers.update(self._forward_auth_headers())
+        upstream_url = f"http://{follower}{self.path}"
+        status, body, hdrs = self._http_get_bytes(upstream_url, upstream_headers, timeout=2.0)
+
+        ok = self._staleness_ok(hdrs, max_lag_lsn=max_lag_lsn, max_age_ms=max_age_ms)
+        if status in (200, 404) and ok:
+            out_headers = {
+                "X-PXKV-Read-Source": "follower",
+                "X-PXKV-Read-Follower": follower,
+                "X-PXKV-Read-Max-Lag-LSN": str(max_lag_lsn),
+                "X-PXKV-Read-Max-Age-MS": str(max_age_ms),
+            }
+            for k in (
+                "X-PXKV-Role",
+                "X-PXKV-Replication-Last-Applied-LSN",
+                "X-PXKV-Replication-Known-Leader-LSN",
+                "X-PXKV-Replication-Lag-LSN",
+                "X-PXKV-Replication-Last-Applied-Age-MS",
+            ):
+                if k in hdrs:
+                    out_headers[k] = hdrs[k]
+            if status == 200:
+                try:
+                    obj = json.loads(body.decode("utf-8")) if body else {}
+                    self._json(200, obj, headers=out_headers)
+                except Exception:
+                    self._send(200, body, headers=out_headers)
+                self._inc_metrics("GET", route="GET /kv (routed_to_follower)")
+                return True
+            self._send(404, body or b"Not Found", headers=out_headers)
+            self._inc_metrics("GET", route="GET /kv (routed_404_follower)")
+            return True
+
+        self._fallback_headers = {
+            "X-PXKV-Read-Source": "leader",
+            "X-PXKV-Read-Follower": follower,
+            "X-PXKV-Read-Fallback": "stale_or_error",
+            "X-PXKV-Read-Upstream-Status": str(status),
+            "X-PXKV-Read-Upstream-Lag-LSN": str(self._parse_int(hdrs.get("X-PXKV-Replication-Lag-LSN", "0"), 0)),
+            "X-PXKV-Read-Upstream-Age-MS": str(self._parse_float(hdrs.get("X-PXKV-Replication-Last-Applied-Age-MS", "0"), 0.0)),
+        }
+        return False
+
     def _send_snapshot_ndjson(self, compress: bool) -> None:
         self._ensure_request_context()
 
@@ -297,6 +434,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._fault_sleep()
         try:
             parts, query = self._parse()
+            if parts and parts[0] == "kv":
+                if self._maybe_route_read_to_follower(parts, query):
+                    return
             if not parts:
                 self._json(200, {"status": "ok"})
                 return
@@ -366,7 +506,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._inc_metrics("GET", route="GET /kv/batch", error=True)
                     return
                 keys = query["keys"][0].split(",")
-                self._json(200, STORE.mget(keys), headers=self._staleness_headers())
+                extra = getattr(self, "_fallback_headers", None)
+                headers = self._staleness_headers()
+                if isinstance(extra, dict):
+                    headers = {**headers, **extra}
+                    self._fallback_headers = None
+                self._json(200, STORE.mget(keys), headers=headers)
                 self._inc_metrics("GET", route="GET /kv/batch")
                 return
 
@@ -386,7 +531,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._inc_metrics("GET", route="GET /kv/scan", error=True)
                         return
                 keys = STORE.scan(prefix=prefix, limit=limit, start_after=start_after)
-                self._json(200, {"keys": keys}, headers=self._staleness_headers())
+                extra = getattr(self, "_fallback_headers", None)
+                headers = self._staleness_headers()
+                if isinstance(extra, dict):
+                    headers = {**headers, **extra}
+                    self._fallback_headers = None
+                self._json(200, {"keys": keys}, headers=headers)
                 self._inc_metrics("GET", route="GET /kv/scan")
                 return
 
@@ -395,16 +545,31 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             key = parts[1]
             value = STORE.read(key)
-            self._json(200, {"key": key, "value": value}, headers=self._staleness_headers())
+            extra = getattr(self, "_fallback_headers", None)
+            headers = self._staleness_headers()
+            if isinstance(extra, dict):
+                headers = {**headers, **extra}
+                self._fallback_headers = None
+            self._json(200, {"key": key, "value": value}, headers=headers)
             self._inc_metrics("GET", route="GET /kv/:key")
         except KeyError as e:
-            self._send(404, str(e), headers=self._staleness_headers())
+            extra = getattr(self, "_fallback_headers", None)
+            headers = self._staleness_headers()
+            if isinstance(extra, dict):
+                headers = {**headers, **extra}
+                self._fallback_headers = None
+            self._send(404, str(e), headers=headers)
             if self.path.startswith("/ai/cache/"):
                 self._inc_metrics("GET", route="GET /ai/cache/:key", error=True)
             else:
                 self._inc_metrics("GET", route="GET /kv/:key", error=True)
         except ValueError:
-            self._send(404, "Not Found", headers=self._staleness_headers())
+            extra = getattr(self, "_fallback_headers", None)
+            headers = self._staleness_headers()
+            if isinstance(extra, dict):
+                headers = {**headers, **extra}
+                self._fallback_headers = None
+            self._send(404, "Not Found", headers=headers)
             self._inc_metrics("GET", route="GET (not_found)", error=True)
 
     def do_PUT(self) -> None:
