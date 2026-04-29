@@ -26,6 +26,15 @@ class MetricsRegistry:
             "replication": {
                 "leader_lsn": 0,
                 "followers": {},
+                "queue": {
+                    "depth": 0,
+                    "max": 0,
+                    "drops_total": 0,
+                    "drops_drop_newest": 0,
+                    "drops_drop_oldest": 0,
+                    "last_drop_at": 0.0,
+                    "last_drop_reason": "",
+                },
             },
         }
 
@@ -98,6 +107,46 @@ class MetricsRegistry:
     def set_replication_leader_lsn(self, leader_lsn: int) -> None:
         replication = self._metrics.setdefault("replication", {"leader_lsn": 0, "followers": {}})
         replication["leader_lsn"] = int(max(0, leader_lsn))
+
+    def observe_replication_queue(self, depth: int, max_size: int) -> None:
+        replication = self._metrics.setdefault("replication", {"leader_lsn": 0, "followers": {}})
+        q = replication.setdefault(
+            "queue",
+            {
+                "depth": 0,
+                "max": 0,
+                "drops_total": 0,
+                "drops_drop_newest": 0,
+                "drops_drop_oldest": 0,
+                "last_drop_at": 0.0,
+                "last_drop_reason": "",
+            },
+        )
+        q["depth"] = int(max(0, depth))
+        q["max"] = int(max(0, max_size))
+
+    def inc_replication_drop(self, policy: str, reason: str) -> None:
+        replication = self._metrics.setdefault("replication", {"leader_lsn": 0, "followers": {}})
+        q = replication.setdefault(
+            "queue",
+            {
+                "depth": 0,
+                "max": 0,
+                "drops_total": 0,
+                "drops_drop_newest": 0,
+                "drops_drop_oldest": 0,
+                "last_drop_at": 0.0,
+                "last_drop_reason": "",
+            },
+        )
+        q["drops_total"] = int(q.get("drops_total", 0) or 0) + 1
+        p = (policy or "").lower()
+        if p == "drop_oldest":
+            q["drops_drop_oldest"] = int(q.get("drops_drop_oldest", 0) or 0) + 1
+        else:
+            q["drops_drop_newest"] = int(q.get("drops_drop_newest", 0) or 0) + 1
+        q["last_drop_at"] = time.time()
+        q["last_drop_reason"] = str(reason or "")
 
     def get_all(self) -> Dict[str, Any]:
         return self._metrics

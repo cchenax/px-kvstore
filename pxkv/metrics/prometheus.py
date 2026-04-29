@@ -64,4 +64,23 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
             f'pxkv_replication_follower_lag_lsn{{follower="{f_label}"}} {int(data.get("lag_lsn", 0) or 0)}'
         )
 
+    q = repl.get("queue", {}) or {}
+    lines.append("# HELP pxkv_replication_queue_depth Current replication queue depth.")
+    lines.append("# TYPE pxkv_replication_queue_depth gauge")
+    lines.append(f"pxkv_replication_queue_depth {int(q.get('depth', 0) or 0)}")
+    lines.append("# HELP pxkv_replication_queue_max Configured replication queue max size.")
+    lines.append("# TYPE pxkv_replication_queue_max gauge")
+    lines.append(f"pxkv_replication_queue_max {int(q.get('max', 0) or 0)}")
+    lines.append("# HELP pxkv_replication_queue_drops_total Total number of replication events dropped due to backpressure.")
+    lines.append("# TYPE pxkv_replication_queue_drops_total counter")
+    lines.append(f"pxkv_replication_queue_drops_total {int(q.get('drops_total', 0) or 0)}")
+    lines.append("# HELP pxkv_replication_queue_drops_by_policy_total Replication drops by shedding policy.")
+    lines.append("# TYPE pxkv_replication_queue_drops_by_policy_total counter")
+    lines.append(
+        f'pxkv_replication_queue_drops_by_policy_total{{policy="drop_newest"}} {int(q.get("drops_drop_newest", 0) or 0)}'
+    )
+    lines.append(
+        f'pxkv_replication_queue_drops_by_policy_total{{policy="drop_oldest"}} {int(q.get("drops_drop_oldest", 0) or 0)}'
+    )
+
     return "\n".join(lines) + "\n"

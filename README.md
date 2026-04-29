@@ -120,7 +120,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Multi-Key Routing Helpers**: Co-locate related keys via hash-tag strategy for better cross-key operations.
 - [x] **Auth & ACL**: Add optional token/password auth and command-level access control.
 - [x] **Follower Read Routing**: Optionally route read traffic to followers with max-staleness guardrails.
-- [ ] **Replication Backpressure**: Bound replication queue growth and shed load with clear metrics.
+- [x] **Replication Backpressure**: Bound replication queue growth and shed load with clear metrics.
 - [ ] **WAL Compaction & Rotation**: Automatic WAL rotation with safe truncation after snapshot.
 - [ ] **Tiering Backends (S3/HTTP)**: Pluggable external object-store backends with async prefetch.
 - [ ] **Keyspace Notifications**: Publish key events (set/del/expire) over HTTP SSE or Redis Pub/Sub.

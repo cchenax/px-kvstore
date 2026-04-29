@@ -62,10 +62,17 @@ class ReplicationManager:
         self.store = store
         self.role = settings.REPLICATION_ROLE
         self._stop_event = threading.Event()
-        
-        self.replication_queue = queue.Queue()
+
+        max_size = int(getattr(settings, "REPLICATION_QUEUE_MAX", 0) or 0)
+        if max_size > 0:
+            self.replication_queue = queue.Queue(maxsize=max_size)
+        else:
+            self.replication_queue = queue.Queue()
         self.followers = [f for f in settings.REPLICATION_FOLLOWERS if f]
         self._follower_ack_lsn: Dict[str, int] = {f: 0 for f in self.followers}
+        self._queue_max = max(0, max_size)
+        self._shed_policy = str(getattr(settings, "REPLICATION_SHED_POLICY", "drop_newest") or "drop_newest").lower()
+        registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
         
         self.leader_addr = settings.REPLICATION_LEADER_ADDR
         self._last_applied_lsn = 0
@@ -171,15 +178,42 @@ class ReplicationManager:
             serialized_key = key
             if op == "mset" and isinstance(key, dict):
                 serialized_key = {k: _serialize(v) for k, v in key.items()}
-            
-            self.replication_queue.put({
+
+            item = {
                 "lsn": lsn,
                 "op": op,
                 "key": serialized_key,
                 "value": serialized_val,
                 "ttl": ttl,
                 "ts": time.time()
-            })
+            }
+
+            try:
+                self.replication_queue.put_nowait(item)
+            except queue.Full:
+                policy = self._shed_policy
+                if policy == "drop_oldest":
+                    try:
+                        _ = self.replication_queue.get_nowait()
+                    except Exception:
+                        registry.inc_replication_drop(policy=policy, reason="queue_full_drop_oldest_failed")
+                        registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
+                        return
+                    try:
+                        self.replication_queue.put_nowait(item)
+                    except Exception:
+                        registry.inc_replication_drop(policy=policy, reason="queue_full_drop_oldest_put_failed")
+                        registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
+                        return
+                    registry.inc_replication_drop(policy=policy, reason="queue_full_drop_oldest")
+                    registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
+                    return
+
+                registry.inc_replication_drop(policy="drop_newest", reason="queue_full_drop_newest")
+                registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
+                return
+
+            registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
 
     def _leader_replication_loop(self):
         while not self._stop_event.is_set():
@@ -192,6 +226,7 @@ class ReplicationManager:
                 except queue.Empty:
                     if not changes:
                         continue
+                registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
 
                 for follower in self.followers:
                     url = f"http://{follower}/replication/sync"

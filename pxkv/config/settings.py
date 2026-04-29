@@ -51,6 +51,8 @@ class Settings:
             self.REPLICATION_LEADER_ADDR = os.getenv("PXKV_REPLICATION_LEADER_ADDR", "127.0.0.1:8000")
             self.REPLICATION_FOLLOWERS = [f for f in os.getenv("PXKV_REPLICATION_FOLLOWERS", "").split(",") if f]
             self.REPLICATION_SYNC_INTERVAL = float(os.getenv("PXKV_REPLICATION_SYNC_INTERVAL", "1.0"))
+            self.REPLICATION_QUEUE_MAX = int(os.getenv("PXKV_REPLICATION_QUEUE_MAX", "10000") or "10000")
+            self.REPLICATION_SHED_POLICY = os.getenv("PXKV_REPLICATION_SHED_POLICY", "drop_newest").lower()
 
             if self.CONFIG_FILE:
                 try:
