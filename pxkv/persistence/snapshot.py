@@ -15,6 +15,16 @@ def load_snapshot(store, path: str) -> bool:
     try:
         with open(path, "r") as f:
             data = json.load(f)
+        if isinstance(data, dict) and "_lsn" in data:
+            try:
+                store._wal._lsn = max(int(store._wal._lsn), int(data.get("_lsn", 0) or 0))
+            except Exception:
+                pass
+            try:
+                data = dict(data)
+                data.pop("_lsn", None)
+            except Exception:
+                pass
         store.load(data)
         logging.info("Restored state from %s", path)
         return True
@@ -35,11 +45,19 @@ class SnapshotManager(threading.Thread):
             return
         tmp = f"{self.path}.tmp"
         try:
-            data = self.store.dump()
+            lsn, data = self.store.dump_with_lsn()
+            payload = dict(data)
+            payload["_lsn"] = int(lsn)
             with open(tmp, "w") as f:
-                json.dump(data, f)
+                json.dump(payload, f)
             os.replace(tmp, self.path)
             logging.info("Saved snapshot to %s", self.path)
+            if settings.WAL_ROTATE_ENABLED and getattr(self.store, "_wal", None) is not None:
+                try:
+                    self.store._wal.rotate_after_snapshot(int(lsn), keep=int(settings.WAL_ROTATE_KEEP))
+                    logging.info("Rotated WAL after snapshot (lsn=%d)", int(lsn))
+                except Exception as e:
+                    logging.warning("WAL rotation failed: %s", e)
         except Exception as e:
             logging.error("Failed to save snapshot: %s", e)
             if os.path.exists(tmp):

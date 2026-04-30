@@ -28,6 +28,8 @@ class Settings:
             self.SNAPSHOT_FILE = os.getenv("PXKV_SNAPSHOT_FILE", "")
             self.SNAPSHOT_INTERVAL = float(os.getenv("PXKV_SNAPSHOT_INTERVAL", "0"))
             self.WAL_FILE = os.getenv("PXKV_WAL_FILE", "")
+            self.WAL_ROTATE_ENABLED = os.getenv("PXKV_WAL_ROTATE_ENABLED", "false").lower() == "true"
+            self.WAL_ROTATE_KEEP = int(os.getenv("PXKV_WAL_ROTATE_KEEP", "0") or "0")
 
             self.REDIS_HOST = os.getenv("PXKV_REDIS_HOST", "0.0.0.0")
             self.REDIS_PORT = int(os.getenv("PXKV_REDIS_PORT", "6379"))

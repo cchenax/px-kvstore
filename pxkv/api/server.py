@@ -408,11 +408,10 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             line = (json.dumps(obj, default=_default, ensure_ascii=False) + "\n").encode("utf-8")
             out.write(line)
 
-        lsn = int(getattr(STORE._wal, "_lsn", 0) or 0)
-        _write_line({"_lsn": lsn, "shards": settings.SHARDS})
-        for i, shard in enumerate(STORE._shards):
-            state = shard.dump_state()
-            _write_line({"shard": i, "state": state})
+        lsn, data = STORE.dump_with_lsn()
+        _write_line({"_lsn": int(lsn), "shards": settings.SHARDS})
+        for idx_str, shard_state in sorted(data.items(), key=lambda kv: int(kv[0])):
+            _write_line({"shard": int(idx_str), "state": shard_state})
 
         try:
             if compress:
@@ -452,9 +451,10 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if fmt == "ndjson":
                     self._send_snapshot_ndjson(compress=compress)
                 else:
-                    data = STORE.dump()
-                    data["_lsn"] = STORE._wal._lsn
-                    self._json(200, data)
+                    lsn, data = STORE.dump_with_lsn()
+                    payload = dict(data)
+                    payload["_lsn"] = int(lsn)
+                    self._json(200, payload)
                 self._inc_metrics("GET", route="GET /replication/snapshot")
                 return
 

@@ -5,6 +5,7 @@ import binascii
 import heapq
 import bisect
 from collections import defaultdict
+import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .lru import LRUKeyValueStore
@@ -40,6 +41,7 @@ class ShardedKeyValueStore(object):
             raise ValueError(f"unknown eviction_policy: {eviction_policy!r}")
         self._eviction_policy = policy
         self._shards = [factory() for _ in range(shards)]
+        self._write_lock = threading.RLock()
 
         self._ring: List[Tuple[int, int]] = []
         for i in range(shards):
@@ -83,47 +85,52 @@ class ShardedKeyValueStore(object):
         return self._shards[self._idx(key)]
 
     def purge_expired(self) -> None:
-        for shard in self._shards:
-            shard.purge_expired()
+        with self._write_lock:
+            for shard in self._shards:
+                shard.purge_expired()
 
     def create(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        self._bucket(key).create(key, value, ttl)
-        lsn = 0
-        if not skip_wal:
-            lsn = self._wal.log("create", key, value, ttl)
-        if not skip_replication:
-            self._replication.enqueue_change("create", key, value, ttl, lsn=lsn)
+        with self._write_lock:
+            self._bucket(key).create(key, value, ttl)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("create", key, value, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change("create", key, value, ttl, lsn=lsn)
 
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
 
     def update(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        self._bucket(key).update(key, value, ttl)
-        lsn = 0
-        if not skip_wal:
-            lsn = self._wal.log("update", key, value, ttl)
-        if not skip_replication:
-            self._replication.enqueue_change("update", key, value, ttl, lsn=lsn)
+        with self._write_lock:
+            self._bucket(key).update(key, value, ttl)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("update", key, value, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change("update", key, value, ttl, lsn=lsn)
 
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        self._bucket(key).delete(key)
-        lsn = 0
-        if not skip_wal:
-            lsn = self._wal.log("delete", key)
-        if not skip_replication:
-            self._replication.enqueue_change("delete", key, lsn=lsn)
+        with self._write_lock:
+            self._bucket(key).delete(key)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("delete", key)
+            if not skip_replication:
+                self._replication.enqueue_change("delete", key, lsn=lsn)
 
     def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
-        for k, v in items.items():
-            grouped[self._idx(k)][k] = v
-        for idx, sub in grouped.items():
-            self._shards[idx].mset(sub, ttl)
-        lsn = 0
-        if not skip_wal:
-            lsn = self._wal.log("mset", items, ttl=ttl)
-        if not skip_replication:
-            self._replication.enqueue_change("mset", items, ttl=ttl, lsn=lsn)
+        with self._write_lock:
+            grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
+            for k, v in items.items():
+                grouped[self._idx(k)][k] = v
+            for idx, sub in grouped.items():
+                self._shards[idx].mset(sub, ttl)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("mset", items, ttl=ttl)
+            if not skip_replication:
+                self._replication.enqueue_change("mset", items, ttl=ttl, lsn=lsn)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
@@ -135,13 +142,14 @@ class ShardedKeyValueStore(object):
         return out
 
     def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> float:
-        val = self._bucket(key).incr(key, delta, ttl)
-        lsn = 0
-        if not skip_wal:
-            lsn = self._wal.log("incr", key, delta, ttl)
-        if not skip_replication:
-            self._replication.enqueue_change("incr", key, delta, ttl, lsn=lsn)
-        return val
+        with self._write_lock:
+            val = self._bucket(key).incr(key, delta, ttl)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("incr", key, delta, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change("incr", key, delta, ttl, lsn=lsn)
+            return val
 
     def keys(self) -> List[Any]:
         all_keys: List[Any] = []
@@ -182,7 +190,14 @@ class ShardedKeyValueStore(object):
         return out
 
     def dump(self) -> Dict[str, Dict[str, Any]]:
-        return {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+        with self._write_lock:
+            return {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+
+    def dump_with_lsn(self) -> tuple[int, Dict[str, Dict[str, Any]]]:
+        with self._write_lock:
+            lsn = int(getattr(self._wal, "_lsn", 0) or 0)
+            data = {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+            return lsn, data
 
     def load(self, data: Dict[str, Dict[str, Any]]) -> None:
         for idx_str, shard_data in data.items():
