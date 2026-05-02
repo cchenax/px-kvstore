@@ -33,6 +33,17 @@ STORE = ShardedKeyValueStore(
     eviction_policy=settings.EVICTION_POLICY,
     wal_path=settings.WAL_FILE,
     tiering_dir=settings.TIERING_DIR,
+    tiering_backend=settings.TIERING_BACKEND,
+    tiering_http_base_url=settings.TIERING_HTTP_BASE_URL,
+    tiering_http_timeout=settings.TIERING_HTTP_TIMEOUT,
+    tiering_s3_bucket=settings.TIERING_S3_BUCKET,
+    tiering_s3_prefix=settings.TIERING_S3_PREFIX,
+    tiering_s3_region=settings.TIERING_S3_REGION,
+    tiering_s3_endpoint_url=settings.TIERING_S3_ENDPOINT_URL,
+    tiering_prefetch_enabled=settings.TIERING_PREFETCH_ENABLED,
+    tiering_prefetch_workers=settings.TIERING_PREFETCH_WORKERS,
+    tiering_prefetch_wait_ms=settings.TIERING_PREFETCH_WAIT_MS,
+    tiering_prefetch_cache_max=settings.TIERING_PREFETCH_CACHE_MAX,
 )
 
 _EXPIRER = BackgroundExpirer(STORE, interval=60.0)

@@ -198,6 +198,16 @@ class LRUKeyValueStore(object):
         with self._lock:
             self._purge_expired()
             out: Dict[Any, Any] = {}
+            if self._tiering is not None and hasattr(self._tiering, "prefetch"):
+                missing: List[Any] = []
+                for k in keys:
+                    if k not in self._map:
+                        missing.append(k)
+                if missing:
+                    try:
+                        self._tiering.prefetch(missing)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
             for k in keys:
                 node = self._map.get(k)
                 if node is None and self._tiering is not None:

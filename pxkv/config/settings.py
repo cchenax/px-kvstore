@@ -36,6 +36,17 @@ class Settings:
             self.REDIS_ENABLED = os.getenv("PXKV_REDIS_ENABLED", "true").lower() == "true"
 
             self.TIERING_DIR = os.getenv("PXKV_TIERING_DIR", "")
+            self.TIERING_BACKEND = os.getenv("PXKV_TIERING_BACKEND", "file" if self.TIERING_DIR else "").lower()
+            self.TIERING_HTTP_BASE_URL = os.getenv("PXKV_TIERING_HTTP_BASE_URL", "")
+            self.TIERING_HTTP_TIMEOUT = float(os.getenv("PXKV_TIERING_HTTP_TIMEOUT", "2.0") or "2.0")
+            self.TIERING_S3_BUCKET = os.getenv("PXKV_TIERING_S3_BUCKET", "")
+            self.TIERING_S3_PREFIX = os.getenv("PXKV_TIERING_S3_PREFIX", "")
+            self.TIERING_S3_REGION = os.getenv("PXKV_TIERING_S3_REGION", "")
+            self.TIERING_S3_ENDPOINT_URL = os.getenv("PXKV_TIERING_S3_ENDPOINT_URL", "")
+            self.TIERING_PREFETCH_ENABLED = os.getenv("PXKV_TIERING_PREFETCH_ENABLED", "true").lower() == "true"
+            self.TIERING_PREFETCH_WORKERS = int(os.getenv("PXKV_TIERING_PREFETCH_WORKERS", "4") or "4")
+            self.TIERING_PREFETCH_WAIT_MS = float(os.getenv("PXKV_TIERING_PREFETCH_WAIT_MS", "25") or "25")
+            self.TIERING_PREFETCH_CACHE_MAX = int(os.getenv("PXKV_TIERING_PREFETCH_CACHE_MAX", "4096") or "4096")
 
             self.AUTH_ADMIN_TOKEN = os.getenv("PXKV_AUTH_ADMIN_TOKEN", "")
             self.AUTH_WRITER_TOKEN = os.getenv("PXKV_AUTH_WRITER_TOKEN", "")

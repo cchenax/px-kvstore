@@ -12,6 +12,7 @@ from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
+from ..tiering.base import TieringBackend
 from ..tiering.file import FileTieringBackend
 
 class ShardedKeyValueStore(object):
@@ -27,12 +28,56 @@ class ShardedKeyValueStore(object):
         vnodes: int = 100,
         wal_path: str = "",
         tiering_dir: str = "",
+        tiering_backend: str = "",
+        tiering_http_base_url: str = "",
+        tiering_http_timeout: float = 2.0,
+        tiering_s3_bucket: str = "",
+        tiering_s3_prefix: str = "",
+        tiering_s3_region: str = "",
+        tiering_s3_endpoint_url: str = "",
+        tiering_prefetch_enabled: bool = True,
+        tiering_prefetch_workers: int = 4,
+        tiering_prefetch_wait_ms: float = 25.0,
+        tiering_prefetch_cache_max: int = 4096,
     ):
         if shards < 1:
             raise ValueError("shards must be >= 1")
         self._num = shards
         policy = (eviction_policy or "lru").strip().lower()
-        tiering = FileTieringBackend(tiering_dir) if tiering_dir else None
+        backend_name = (tiering_backend or "").strip().lower()
+        tiering: TieringBackend | None = None
+        if backend_name in ("", "none"):
+            if tiering_dir:
+                tiering = FileTieringBackend(tiering_dir)
+        elif backend_name == "file":
+            if not tiering_dir:
+                raise ValueError("tiering_dir is required for file tiering backend")
+            tiering = FileTieringBackend(tiering_dir)
+        elif backend_name == "http":
+            from ..tiering.http import HttpTieringBackend
+
+            tiering = HttpTieringBackend(tiering_http_base_url, timeout=float(tiering_http_timeout))
+        elif backend_name == "s3":
+            from ..tiering.s3 import S3TieringBackend
+
+            tiering = S3TieringBackend(
+                bucket=tiering_s3_bucket,
+                prefix=tiering_s3_prefix,
+                region=tiering_s3_region,
+                endpoint_url=tiering_s3_endpoint_url,
+            )
+        else:
+            raise ValueError(f"unknown tiering_backend: {tiering_backend!r}")
+
+        if tiering is not None and tiering_prefetch_enabled:
+            from ..tiering.prefetch import AsyncPrefetchTieringBackend
+
+            tiering = AsyncPrefetchTieringBackend(
+                tiering,
+                workers=int(tiering_prefetch_workers),
+                wait_ms=float(tiering_prefetch_wait_ms),
+                cache_max=int(tiering_prefetch_cache_max),
+            )
         if policy == "lfu":
             factory = lambda: LFUKeyValueStore(per_shard_max, tiering=tiering)
         elif policy == "lru":
