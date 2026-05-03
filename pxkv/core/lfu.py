@@ -31,7 +31,7 @@ class LFUKeyValueStore(object):
         self._freq[key] = self._freq.get(key, 0) + 1
         self._last[key] = self._seq
 
-    def _purge_expired(self) -> None:
+    def _purge_expired_keys(self) -> List[Any]:
         now = time.time()
         expired: List[Any] = []
         for k, ts in self._ttl.items():
@@ -39,6 +39,10 @@ class LFUKeyValueStore(object):
                 expired.append(k)
         for k in expired:
             self._delete(k)
+        return expired
+
+    def _purge_expired(self) -> None:
+        _ = self._purge_expired_keys()
 
     def _delete(self, key: Any) -> None:
         self._map.pop(key, None)
@@ -72,6 +76,10 @@ class LFUKeyValueStore(object):
     def purge_expired(self) -> None:
         with self._lock:
             self._purge_expired()
+
+    def purge_expired_keys(self) -> List[Any]:
+        with self._lock:
+            return self._purge_expired_keys()
 
     def create(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         with self._lock:

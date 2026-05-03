@@ -14,6 +14,7 @@ import urllib.error
 import uuid
 import random
 import gzip
+from queue import Empty
 from typing import Any, Dict, Tuple, Optional
 
 from ..core.sharded import ShardedKeyValueStore
@@ -26,6 +27,7 @@ from ..core.expiration import BackgroundExpirer
 from ..config.settings import settings
 from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
+from ..notifications import notifier
 
 STORE = ShardedKeyValueStore(
     shards=settings.SHARDS,
@@ -451,6 +453,38 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._json(200, {"status": "ok"})
                 return
 
+            if parts == ["events", "keyspace"]:
+                if not self._require_role(ROLE_READER):
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                sid, q = notifier.subscribe()
+                try:
+                    while True:
+                        try:
+                            ev = q.get(timeout=15.0)
+                            payload = ev.to_json()
+                            self.wfile.write(b"event: keyspace\n")
+                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                            try:
+                                self.wfile.flush()
+                            except Exception:
+                                pass
+                        except Empty:
+                            try:
+                                self.wfile.write(b": ping\n\n")
+                                self.wfile.flush()
+                            except Exception:
+                                break
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                finally:
+                    notifier.unsubscribe(sid)
+                return
+
             if parts == ["replication", "snapshot"]:
                 if not self._require_role(ROLE_ADMIN):
                     return
@@ -871,7 +905,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 def run() -> None:
     STORE._replication.start()
 
-    httpd = BaseHTTPServer.HTTPServer((settings.HOST, settings.PORT), KVHandler)
+    httpd = BaseHTTPServer.ThreadingHTTPServer((settings.HOST, settings.PORT), KVHandler)
     logging.info(
         "Serving on http://%s:%d  shards=%d per_shard_max=%d",
         settings.HOST,

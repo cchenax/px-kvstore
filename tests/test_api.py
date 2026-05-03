@@ -4,6 +4,7 @@ import time
 import json
 import urllib.request
 import gzip
+import threading
 
 import pytest
 
@@ -88,3 +89,38 @@ def test_replication_snapshot_ndjson_gzip(http_server):
     meta = json.loads(lines[0])
     assert "_lsn" in meta
     assert "shards" in meta
+
+
+def test_sse_keyspace_notifications(http_server):
+    url = f"{http_server}/events/keyspace"
+    got = {"payload": None}
+
+    def _reader():
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                line = resp.readline()
+                if not line:
+                    break
+                if line.startswith(b"data: "):
+                    got["payload"] = line[len(b"data: ") :].decode("utf-8", errors="replace").strip()
+                    break
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    put = urllib.request.Request(
+        f"{http_server}/kv/sse_test_key",
+        data=json.dumps({"value": "v"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(put, timeout=2.0) as resp:
+        assert resp.status in (200, 201)
+
+    t.join(timeout=3.0)
+    assert got["payload"] is not None
+    ev = json.loads(got["payload"])
+    assert ev["op"] == "set"
+    assert ev["key"] == "sse_test_key"

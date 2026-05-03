@@ -52,7 +52,7 @@ class LRUKeyValueStore(object):
         self._remove(node)
         self._append(node)
 
-    def _purge_expired(self) -> None:
+    def _purge_expired_keys(self) -> List[Any]:
         now = time.time()
 
         expired = []
@@ -62,6 +62,10 @@ class LRUKeyValueStore(object):
 
         for k in expired:
             self._delete(k)
+        return expired
+
+    def _purge_expired(self) -> None:
+        _ = self._purge_expired_keys()
 
     def _evict_if_needed(self) -> None:
         while self._max and len(self._map) > self._max:
@@ -89,6 +93,10 @@ class LRUKeyValueStore(object):
     def purge_expired(self) -> None:
         with self._lock:
             self._purge_expired()
+
+    def purge_expired_keys(self) -> List[Any]:
+        with self._lock:
+            return self._purge_expired_keys()
 
     def create(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         with self._lock:

@@ -14,6 +14,7 @@ from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..tiering.base import TieringBackend
 from ..tiering.file import FileTieringBackend
+from ..notifications import notifier
 
 class ShardedKeyValueStore(object):
     """
@@ -131,8 +132,17 @@ class ShardedKeyValueStore(object):
 
     def purge_expired(self) -> None:
         with self._write_lock:
-            for shard in self._shards:
-                shard.purge_expired()
+            for idx, shard in enumerate(self._shards):
+                keys = []
+                if hasattr(shard, "purge_expired_keys"):
+                    try:
+                        keys = shard.purge_expired_keys()
+                    except Exception:
+                        keys = []
+                else:
+                    shard.purge_expired()
+                for k in keys:
+                    notifier.publish("expire", k, lsn=int(getattr(self._wal, "_lsn", 0) or 0), shard=idx)
 
     def create(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
@@ -142,6 +152,8 @@ class ShardedKeyValueStore(object):
                 lsn = self._wal.log("create", key, value, ttl)
             if not skip_replication:
                 self._replication.enqueue_change("create", key, value, ttl, lsn=lsn)
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
 
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
@@ -154,6 +166,8 @@ class ShardedKeyValueStore(object):
                 lsn = self._wal.log("update", key, value, ttl)
             if not skip_replication:
                 self._replication.enqueue_change("update", key, value, ttl, lsn=lsn)
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
 
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
@@ -163,6 +177,8 @@ class ShardedKeyValueStore(object):
                 lsn = self._wal.log("delete", key)
             if not skip_replication:
                 self._replication.enqueue_change("delete", key, lsn=lsn)
+            shard = self._idx(key)
+            notifier.publish("del", key, lsn=lsn, shard=shard)
 
     def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
@@ -176,6 +192,9 @@ class ShardedKeyValueStore(object):
                 lsn = self._wal.log("mset", items, ttl=ttl)
             if not skip_replication:
                 self._replication.enqueue_change("mset", items, ttl=ttl, lsn=lsn)
+            for k in items.keys():
+                shard = self._idx(k)
+                notifier.publish("set", k, lsn=lsn, shard=shard)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
@@ -194,6 +213,8 @@ class ShardedKeyValueStore(object):
                 lsn = self._wal.log("incr", key, delta, ttl)
             if not skip_replication:
                 self._replication.enqueue_change("incr", key, delta, ttl, lsn=lsn)
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
             return val
 
     def keys(self) -> List[Any]:

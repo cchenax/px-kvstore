@@ -5,11 +5,14 @@ import socket
 import threading
 import logging
 import time
+import json
+from queue import Empty
 from typing import Any, List, Optional
 
 from ..metrics.registry import registry
 from ..config.settings import settings
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, role_satisfies
+from ..notifications import notifier
 
 def encode_simple_string(s: str) -> bytes:
     return f"+{s}\r\n".encode("utf-8")
@@ -80,11 +83,30 @@ class RedisServer(threading.Thread):
 
     def handle_client(self, conn, addr):
         logging.info("Redis client connected from %s", addr)
+        conn.settimeout(0.2)
         f = conn.makefile("rb")
         role: Optional[str] = None
+        sub_sid: Optional[int] = None
+        sub_q = None
+        subs: set[str] = set()
         try:
             while not self._stop_event.is_set():
-                line = f.readline()
+                if sub_q is not None and subs:
+                    while True:
+                        try:
+                            ev = sub_q.get_nowait()
+                        except Empty:
+                            break
+                        payload = ev.to_json()
+                        op = str(ev.op)
+                        for ch in list(subs):
+                            if ch == "pxkv:keyspace" or ch == f"pxkv:keyspace:{op}":
+                                conn.sendall(encode_array(["message", ch, payload]))
+
+                try:
+                    line = f.readline()
+                except socket.timeout:
+                    continue
                 if not line:
                     break
                 
@@ -104,12 +126,65 @@ class RedisServer(threading.Thread):
                 
                 if not args:
                     continue
-                
+
+                cmd = args[0].decode("utf-8", errors="replace").upper()
+                if cmd in ("SUBSCRIBE", "UNSUBSCRIBE"):
+                    if self._auth_enabled():
+                        if role is None:
+                            conn.sendall(encode_error("NOAUTH Authentication required."))
+                            continue
+                        if not role_satisfies(role, ROLE_READER):
+                            conn.sendall(encode_error("NOPERM this user has no permissions to run the command"))
+                            continue
+                    if cmd == "SUBSCRIBE":
+                        if len(args) < 2:
+                            conn.sendall(encode_error("ERR wrong number of arguments for 'SUBSCRIBE' command"))
+                            continue
+                        if sub_sid is None:
+                            sub_sid, sub_q = notifier.subscribe()
+                        for i in range(1, len(args)):
+                            ch = args[i].decode("utf-8", errors="replace")
+                            subs.add(ch)
+                        resp = b""
+                        for ch in subs:
+                            resp += encode_array(["subscribe", ch, len(subs)])
+                        conn.sendall(resp)
+                        continue
+
+                    if cmd == "UNSUBSCRIBE":
+                        if len(args) == 1:
+                            subs.clear()
+                        else:
+                            for i in range(1, len(args)):
+                                ch = args[i].decode("utf-8", errors="replace")
+                                subs.discard(ch)
+                        resp = b""
+                        if subs:
+                            for ch in subs:
+                                resp += encode_array(["unsubscribe", ch, len(subs)])
+                        else:
+                            resp += encode_array(["unsubscribe", None, 0])
+                            if sub_sid is not None:
+                                notifier.unsubscribe(sub_sid)
+                            sub_sid = None
+                            sub_q = None
+                        conn.sendall(resp)
+                        continue
+
+                if subs:
+                    if cmd in ("PING",):
+                        conn.sendall(encode_array(["pong", ""]))
+                        continue
+                    conn.sendall(encode_error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING are allowed in this context"))
+                    continue
+
                 response, role = self.handle_command(args, role)
                 conn.sendall(response)
         except Exception as e:
             logging.debug("Redis client error: %s", e)
         finally:
+            if sub_sid is not None:
+                notifier.unsubscribe(sub_sid)
             conn.close()
             logging.info("Redis client disconnected from %s", addr)
 
@@ -137,7 +212,7 @@ class RedisServer(threading.Thread):
         )
 
     def _required_role_for_cmd(self, cmd: str) -> str:
-        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE"):
+        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "SUBSCRIBE", "UNSUBSCRIBE"):
             return ROLE_READER
         if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "FLUSHALL"):
             return ROLE_WRITER
