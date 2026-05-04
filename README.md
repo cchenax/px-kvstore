@@ -124,7 +124,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **WAL Compaction & Rotation**: Automatic WAL rotation with safe truncation after snapshot.
 - [x] **Tiering Backends (S3/HTTP)**: Pluggable external object-store backends with async prefetch.
 - [x] **Keyspace Notifications**: Publish key events (set/del/expire) over HTTP SSE or Redis Pub/Sub.
-- [ ] **Rate Limiting**: Per-route token bucket limits with admin-configurable policies.
+- [x] **Rate Limiting**: Per-route token bucket limits with admin-configurable policies.
 
 ---
 

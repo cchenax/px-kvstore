@@ -3,6 +3,7 @@ import subprocess
 import time
 import json
 import urllib.request
+import urllib.error
 import gzip
 import threading
 
@@ -124,3 +125,64 @@ def test_sse_keyspace_notifications(http_server):
     ev = json.loads(got["payload"])
     assert ev["op"] == "set"
     assert ev["key"] == "sse_test_key"
+
+
+def test_rate_limiting_per_route_admin_configurable():
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+    env["PXKV_RATE_LIMIT_ENABLED"] = "true"
+    env["PXKV_RATE_LIMIT_DEFAULT_RPS"] = "0"
+    env["PXKV_RATE_LIMIT_DEFAULT_BURST"] = "0"
+    env["PXKV_RATE_LIMIT_ROUTES"] = json.dumps(
+        {"GET /admin/health": {"rps": 0.1, "burst": 1, "per_ip": False}}
+    )
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/metrics", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        with urllib.request.urlopen(f"{base}/admin/health", timeout=2.0) as resp:
+            assert resp.status == 200
+
+        try:
+            urllib.request.urlopen(f"{base}/admin/health", timeout=2.0)
+            raise AssertionError("expected 429")
+        except urllib.error.HTTPError as e:
+            assert e.code == 429
+            assert (e.headers.get("Retry-After", "") or "").strip() != ""
+
+        with urllib.request.urlopen(f"{base}/admin/metrics", timeout=2.0) as resp:
+            assert resp.status == 200
+        with urllib.request.urlopen(f"{base}/admin/metrics", timeout=2.0) as resp:
+            assert resp.status == 200
+
+        data = json.dumps(
+            {"RATE_LIMIT_ROUTES": {"GET /admin/health": {"rps": 100, "burst": 100, "per_ip": False}}}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/admin/config",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            assert resp.status == 200
+            updated = json.loads(resp.read().decode("utf-8"))
+        assert updated["config"]["RATE_LIMIT_ROUTES"]["GET /admin/health"]["rps"] == 100.0
+
+        with urllib.request.urlopen(f"{base}/admin/health", timeout=2.0) as resp:
+            assert resp.status == 200
+    finally:
+        stop_proc(proc)

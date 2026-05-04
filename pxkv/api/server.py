@@ -8,12 +8,14 @@ import os
 import signal
 import sys
 import time
+import math
 import urllib.parse as urlparse
 import urllib.request
 import urllib.error
 import uuid
 import random
 import gzip
+from threading import RLock
 from queue import Empty
 from typing import Any, Dict, Tuple, Optional
 
@@ -67,9 +69,113 @@ if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
     _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
     _SNAPSHOT_MANAGER.start()
 
+class _TokenBucket:
+    def __init__(self, rate_per_sec: float, capacity: int):
+        self.rate_per_sec = float(rate_per_sec)
+        self.capacity = int(capacity)
+        self.tokens = float(capacity)
+        self.updated_at = time.monotonic()
+        self._lock = RLock()
+
+    def update_limits(self, rate_per_sec: float, capacity: int) -> None:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self.updated_at)
+            self.tokens = min(float(self.capacity), self.tokens + elapsed * float(self.rate_per_sec))
+            self.updated_at = now
+            self.rate_per_sec = float(rate_per_sec)
+            self.capacity = int(capacity)
+            self.tokens = min(float(self.capacity), self.tokens)
+
+    def allow(self, cost: float = 1.0) -> tuple[bool, float]:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self.updated_at)
+            self.tokens = min(float(self.capacity), self.tokens + elapsed * float(self.rate_per_sec))
+            self.updated_at = now
+
+            if self.tokens >= float(cost):
+                self.tokens -= float(cost)
+                return True, 0.0
+
+            if self.rate_per_sec <= 0:
+                return False, 3600.0
+
+            missing = float(cost) - self.tokens
+            retry_after = missing / float(self.rate_per_sec)
+            return False, retry_after
+
+
+class _RateLimiter:
+    def __init__(self):
+        self._lock = RLock()
+        self._enabled = False
+        self._default_policy: dict = {"rps": 0.0, "burst": 0, "per_ip": True}
+        self._route_policies: dict = {}
+        self._buckets: dict[str, _TokenBucket] = {}
+
+    def configure(self, enabled: bool, default_policy: dict, route_policies: dict) -> None:
+        with self._lock:
+            self._enabled = bool(enabled)
+            self._default_policy = default_policy or {"rps": 0.0, "burst": 0, "per_ip": True}
+            self._route_policies = route_policies or {}
+            self._buckets = {}
+
+    def configure_from_settings(self) -> None:
+        self.configure(
+            enabled=getattr(settings, "RATE_LIMIT_ENABLED", False),
+            default_policy=getattr(settings, "RATE_LIMIT_DEFAULT", None) or {"rps": 0.0, "burst": 0, "per_ip": True},
+            route_policies=getattr(settings, "RATE_LIMIT_ROUTES", None) or {},
+        )
+
+    def _policy_for(self, route: str) -> tuple[float, int, bool] | None:
+        pol = (self._route_policies or {}).get(route)
+        if not isinstance(pol, dict):
+            pol = self._default_policy or {}
+
+        try:
+            rps = float(pol.get("rps", 0.0) or 0.0)
+            burst = int(pol.get("burst", 0) or 0)
+            per_ip = bool(pol.get("per_ip", True))
+        except Exception:
+            return None
+
+        if rps <= 0 or burst <= 0:
+            return None
+        return rps, burst, per_ip
+
+    def allow(self, route: str, client_ip: str) -> tuple[bool, int]:
+        with self._lock:
+            if not self._enabled:
+                return True, 0
+            policy = self._policy_for(route)
+            if policy is None:
+                return True, 0
+            rps, burst, per_ip = policy
+            dim = client_ip if per_ip else "*"
+            key = f"{route}|{dim}"
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _TokenBucket(rps, burst)
+                self._buckets[key] = bucket
+            elif bucket.rate_per_sec != rps or bucket.capacity != burst:
+                bucket.update_limits(rps, burst)
+
+        ok, retry_after = bucket.allow(1.0)
+        if ok:
+            return True, 0
+        retry_s = int(max(1.0, math.ceil(retry_after)))
+        return False, retry_s
+
+
+_RATE_LIMITER = _RateLimiter()
+_RATE_LIMITER.configure_from_settings()
+
 def _apply_runtime_config() -> None:
     global _REDIS_SERVER
     global _SNAPSHOT_MANAGER
+
+    _RATE_LIMITER.configure_from_settings()
 
     if settings.REDIS_ENABLED:
         if _REDIS_SERVER is None:
@@ -96,6 +202,29 @@ def _apply_runtime_config() -> None:
 class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     server_version = "PX-KVStore/2.0"
     protocol_version = "HTTP/1.1"
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "") or ""
+        if xff.strip():
+            return xff.split(",")[0].strip()
+        try:
+            return str(self.client_address[0])
+        except Exception:
+            return ""
+
+    def _rate_limit(self, route: str) -> bool:
+        if route in ("GET /admin/config", "POST /admin/config", "POST /admin/config/reload"):
+            return True
+        ok, retry_after_s = _RATE_LIMITER.allow(route, self._client_ip())
+        if ok:
+            return True
+        self._json(
+            429,
+            {"error": "rate_limited", "route": route, "retry_after_seconds": retry_after_s},
+            headers={"Retry-After": str(retry_after_s)},
+        )
+        self._inc_metrics(self.command or "GET", route=route, error=True)
+        return False
 
     def _fault_sleep(self) -> None:
         if settings.FAULT_LATENCY_MS <= 0 and settings.FAULT_LATENCY_JITTER_MS <= 0:
@@ -446,14 +575,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._fault_sleep()
         try:
             parts, query = self._parse()
-            if parts and parts[0] == "kv":
-                if self._maybe_route_read_to_follower(parts, query):
-                    return
             if not parts:
+                if not self._rate_limit("GET /"):
+                    return
                 self._json(200, {"status": "ok"})
+                self._inc_metrics("GET", route="GET /")
                 return
 
             if parts == ["events", "keyspace"]:
+                if not self._rate_limit("GET /events/keyspace"):
+                    return
                 if not self._require_role(ROLE_READER):
                     return
                 self.send_response(200)
@@ -486,6 +617,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["replication", "snapshot"]:
+                if not self._rate_limit("GET /replication/snapshot"):
+                    return
                 if not self._require_role(ROLE_ADMIN):
                     return
                 if settings.REPLICATION_ROLE != "leader":
@@ -504,6 +637,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["replication", "wal"]:
+                if not self._rate_limit("GET /replication/wal"):
+                    return
                 if not self._require_role(ROLE_ADMIN):
                     return
                 if settings.REPLICATION_ROLE != "leader":
@@ -527,6 +662,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts[0] == "ai":
+                if not self._rate_limit("GET /ai/cache/:key"):
+                    return
                 if not self._require_role(ROLE_READER):
                     return
                 if len(parts) >= 2 and parts[1] == "cache":
@@ -542,6 +679,20 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if parts[0] != "kv":
                 raise ValueError
+
+            if len(parts) >= 2 and parts[1] == "batch":
+                if not self._rate_limit("GET /kv/batch"):
+                    return
+            elif len(parts) >= 2 and parts[1] == "scan":
+                if not self._rate_limit("GET /kv/scan"):
+                    return
+            else:
+                if not self._rate_limit("GET /kv/:key"):
+                    return
+
+            if parts and parts[0] == "kv":
+                if self._maybe_route_read_to_follower(parts, query):
+                    return
 
             if not self._require_role(ROLE_READER):
                 return
@@ -622,6 +773,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if not self._rate_limit("PUT /kv/:key"):
+                return
             if not self._require_role(ROLE_WRITER):
                 return
             if settings.REPLICATION_ROLE == "follower":
@@ -658,6 +811,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_started_at = time.time()
         self._fault_sleep()
         try:
+            if not self._rate_limit("DELETE /kv/:key"):
+                return
             if not self._require_role(ROLE_WRITER):
                 return
             if settings.REPLICATION_ROLE == "follower":
@@ -684,6 +839,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             parts, _ = self._parse()
             
             if parts == ["replication", "sync"]:
+                if not self._rate_limit("POST /replication/sync"):
+                    return
                 if not self._require_role(ROLE_ADMIN):
                     return
                 if settings.REPLICATION_ROLE != "follower":
@@ -706,6 +863,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if len(parts) >= 1 and parts[0] == "ai":
                 if parts == ["ai", "cache", "lookup"]:
+                    if not self._rate_limit("POST /ai/cache/lookup"):
+                        return
                     if not self._require_role(ROLE_READER):
                         return
                     payload = json.loads(self._body() or b"{}")
@@ -734,6 +893,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
                 if parts == ["ai", "cache"]:
+                    if not self._rate_limit("POST /ai/cache"):
+                        return
                     if not self._require_role(ROLE_WRITER):
                         return
                     if settings.REPLICATION_ROLE == "follower":
@@ -773,6 +934,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":
+                if not self._rate_limit("POST /kv/incr/:key"):
+                    return
                 if not self._require_role(ROLE_WRITER):
                     return
                 if settings.REPLICATION_ROLE == "follower":
@@ -806,6 +969,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /kv/incr/:key")
                 return
             if parts == ["kv", "batch"]:
+                if not self._rate_limit("POST /kv/batch"):
+                    return
                 if not self._require_role(ROLE_WRITER):
                     return
                 if settings.REPLICATION_ROLE == "follower":
@@ -824,6 +989,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["admin", "config"]:
+                if not self._rate_limit("POST /admin/config"):
+                    return
                 if not self._require_role(ROLE_ADMIN):
                     return
                 payload = json.loads(self._body() or b"{}")
@@ -834,6 +1001,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["admin", "config", "reload"]:
+                if not self._rate_limit("POST /admin/config/reload"):
+                    return
                 if not self._require_role(ROLE_ADMIN):
                     return
                 settings.reload()
@@ -850,10 +1019,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _handle_admin_get(self, parts: list[str], query: Dict[str, list[str]]) -> None:
         if not parts:
+            if not self._rate_limit("GET /admin"):
+                return
             self._json(200, {"status": "ok", "shards": settings.SHARDS, "role": settings.REPLICATION_ROLE})
             self._inc_metrics("GET", route="GET /admin")
             return
         if parts[0] == "health":
+            if not self._rate_limit("GET /admin/health"):
+                return
             repl = STORE._replication.get_staleness() if settings.REPLICATION_ROLE == "follower" else None
             self._json(
                 200,
@@ -867,6 +1040,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /admin/health")
             return
         if parts[0] == "metrics":
+            if not self._rate_limit("GET /admin/metrics"):
+                return
             fmt = query.get("format", ["json"])[0]
             if fmt == "prometheus":
                 prom_data = registry_to_prometheus(registry.get_all())
@@ -876,6 +1051,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /admin/metrics")
             return
         if parts[0] == "snapshot":
+            if not self._rate_limit("GET /admin/snapshot"):
+                return
             if _SNAPSHOT_MANAGER is None or not settings.SNAPSHOT_FILE:
                 self._send(400, "snapshotting is disabled")
                 self._inc_metrics("GET", route="GET /admin/snapshot", error=True)
@@ -890,6 +1067,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return
         
         if parts[0] == "config":
+            if not self._rate_limit("GET /admin/config"):
+                return
             self._json(200, settings.to_dict())
             self._inc_metrics("GET", route="GET /admin/config")
             return

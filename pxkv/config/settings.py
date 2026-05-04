@@ -55,6 +55,22 @@ class Settings:
             self.AUTH_WRITER_PASSWORD = os.getenv("PXKV_AUTH_WRITER_PASSWORD", "")
             self.AUTH_READER_PASSWORD = os.getenv("PXKV_AUTH_READER_PASSWORD", "")
 
+            self.RATE_LIMIT_ENABLED = os.getenv("PXKV_RATE_LIMIT_ENABLED", "false").lower() == "true"
+            self.RATE_LIMIT_DEFAULT = {
+                "rps": float(os.getenv("PXKV_RATE_LIMIT_DEFAULT_RPS", "0") or "0"),
+                "burst": int(os.getenv("PXKV_RATE_LIMIT_DEFAULT_BURST", "0") or "0"),
+                "per_ip": os.getenv("PXKV_RATE_LIMIT_DEFAULT_PER_IP", "true").lower() == "true",
+            }
+            self.RATE_LIMIT_ROUTES = {}
+            routes_json = os.getenv("PXKV_RATE_LIMIT_ROUTES", "") or ""
+            if routes_json.strip():
+                try:
+                    parsed = json.loads(routes_json)
+                    if isinstance(parsed, dict):
+                        self.RATE_LIMIT_ROUTES = parsed
+                except Exception as e:
+                    logging.warning("Failed to parse PXKV_RATE_LIMIT_ROUTES: %s", e)
+
             self.FOLLOWER_READ_ENABLED = os.getenv("PXKV_FOLLOWER_READ_ENABLED", "false").lower() == "true"
             self.FOLLOWER_READ_MAX_LAG_LSN = int(os.getenv("PXKV_FOLLOWER_READ_MAX_LAG_LSN", "0") or "0")
             self.FOLLOWER_READ_MAX_AGE_MS = float(os.getenv("PXKV_FOLLOWER_READ_MAX_AGE_MS", "0") or "0")
@@ -80,12 +96,30 @@ class Settings:
     def update(self, new_settings: dict):
         """Update specific settings dynamically."""
         with self._lock:
+            def _to_bool(v):
+                if isinstance(v, bool):
+                    return v
+                return str(v).lower() == "true"
+
+            def _policy_merge(base: dict, patch: dict) -> dict:
+                out = dict(base or {})
+                if not isinstance(patch, dict):
+                    raise TypeError("policy must be an object")
+                if "rps" in patch:
+                    out["rps"] = float(patch["rps"])
+                if "burst" in patch:
+                    out["burst"] = int(patch["burst"])
+                if "per_ip" in patch:
+                    out["per_ip"] = _to_bool(patch["per_ip"])
+                return out
+
             updatable = {
                 "FAULT_LATENCY_MS": float,
                 "FAULT_LATENCY_JITTER_MS": float,
                 "SNAPSHOT_INTERVAL": float,
                 "REPLICATION_SYNC_INTERVAL": float,
-                "REDIS_ENABLED": lambda v: str(v).lower() == "true",
+                "REDIS_ENABLED": _to_bool,
+                "RATE_LIMIT_ENABLED": _to_bool,
             }
             for key, val in new_settings.items():
                 if key in updatable:
@@ -95,6 +129,30 @@ class Settings:
                         logging.info("Setting %s updated to %s", key, typed_val)
                     except (ValueError, TypeError) as e:
                         logging.warning("Failed to update setting %s: %s", key, e)
+                elif key == "RATE_LIMIT_DEFAULT":
+                    try:
+                        if isinstance(val, str):
+                            val = json.loads(val)
+                        self.RATE_LIMIT_DEFAULT = _policy_merge(self.RATE_LIMIT_DEFAULT, val)
+                        logging.info("Setting RATE_LIMIT_DEFAULT updated to %s", self.RATE_LIMIT_DEFAULT)
+                    except Exception as e:
+                        logging.warning("Failed to update setting RATE_LIMIT_DEFAULT: %s", e)
+                elif key == "RATE_LIMIT_ROUTES":
+                    try:
+                        if isinstance(val, str):
+                            val = json.loads(val)
+                        if not isinstance(val, dict):
+                            raise TypeError("RATE_LIMIT_ROUTES must be an object")
+                        merged = dict(self.RATE_LIMIT_ROUTES or {})
+                        for route, pol in val.items():
+                            if pol is None:
+                                merged.pop(route, None)
+                                continue
+                            merged[route] = _policy_merge(self.RATE_LIMIT_DEFAULT, pol)
+                        self.RATE_LIMIT_ROUTES = merged
+                        logging.info("Setting RATE_LIMIT_ROUTES updated (%d routes)", len(self.RATE_LIMIT_ROUTES))
+                    except Exception as e:
+                        logging.warning("Failed to update setting RATE_LIMIT_ROUTES: %s", e)
 
     def to_dict(self):
         """Return current settings as a dictionary."""
