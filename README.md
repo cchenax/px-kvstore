@@ -125,6 +125,12 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Tiering Backends (S3/HTTP)**: Pluggable external object-store backends with async prefetch.
 - [x] **Keyspace Notifications**: Publish key events (set/del/expire) over HTTP SSE or Redis Pub/Sub.
 - [x] **Rate Limiting**: Per-route token bucket limits with admin-configurable policies.
+- [ ] **TLS / HTTPS**: Optional TLS listener for HTTP and Redis endpoints.
+- [ ] **Request Tracing**: Add OpenTelemetry trace spans for API and replication paths.
+- [ ] **Redis TTL Parity**: Support TTL/PTTL/PERSIST for better Redis compatibility.
+- [ ] **SCAN Cursor**: True cursor-based scan for large keyspaces without `start_after` hacks.
+- [ ] **ETag / Conditional GET**: Return ETag for GET /kv and honor If-None-Match to save bandwidth.
+- [ ] **Read Repair / Anti-Entropy**: Background verification and repair for follower divergence.
 
 ---
 
