@@ -9,6 +9,8 @@ import signal
 import sys
 import time
 import math
+import ssl
+import threading
 import urllib.parse as urlparse
 import urllib.request
 import urllib.error
@@ -30,6 +32,20 @@ from ..config.settings import settings
 from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 from ..notifications import notifier
+
+def _server_ssl_context(cert_file: str, key_file: str) -> Optional[ssl.SSLContext]:
+    if not cert_file or not key_file:
+        return None
+    if not os.path.exists(cert_file) or not os.path.exists(key_file):
+        logging.warning("TLS enabled but cert/key file missing: cert=%s key=%s", cert_file, key_file)
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        return ctx
+    except Exception as e:
+        logging.warning("Failed to initialize TLS context: %s", e)
+        return None
 
 STORE = ShardedKeyValueStore(
     shards=settings.SHARDS,
@@ -63,6 +79,13 @@ _REDIS_SERVER: RedisServer | None = None
 if settings.REDIS_ENABLED:
     _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
     _REDIS_SERVER.start()
+
+_REDIS_TLS_SERVER: RedisServer | None = None
+if getattr(settings, "REDIS_TLS_ENABLED", False):
+    ctx = _server_ssl_context(getattr(settings, "REDIS_TLS_CERT_FILE", ""), getattr(settings, "REDIS_TLS_KEY_FILE", ""))
+    if ctx is not None:
+        _REDIS_TLS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_TLS_PORT, ssl_context=ctx)
+        _REDIS_TLS_SERVER.start()
 
 _SNAPSHOT_MANAGER: SnapshotManager | None = None
 if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
@@ -173,6 +196,7 @@ _RATE_LIMITER.configure_from_settings()
 
 def _apply_runtime_config() -> None:
     global _REDIS_SERVER
+    global _REDIS_TLS_SERVER
     global _SNAPSHOT_MANAGER
 
     _RATE_LIMITER.configure_from_settings()
@@ -187,6 +211,19 @@ def _apply_runtime_config() -> None:
                 _REDIS_SERVER.stop()
             finally:
                 _REDIS_SERVER = None
+
+    if getattr(settings, "REDIS_TLS_ENABLED", False):
+        if _REDIS_TLS_SERVER is None:
+            ctx = _server_ssl_context(getattr(settings, "REDIS_TLS_CERT_FILE", ""), getattr(settings, "REDIS_TLS_KEY_FILE", ""))
+            if ctx is not None:
+                _REDIS_TLS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_TLS_PORT, ssl_context=ctx)
+                _REDIS_TLS_SERVER.start()
+    else:
+        if _REDIS_TLS_SERVER is not None:
+            try:
+                _REDIS_TLS_SERVER.stop()
+            finally:
+                _REDIS_TLS_SERVER = None
 
     if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
         if _SNAPSHOT_MANAGER is None:
@@ -1093,9 +1130,42 @@ def run() -> None:
         settings.PER_SHARD_MAX,
     )
 
+    httpsd = None
+    https_thread = None
+    if getattr(settings, "HTTP_TLS_ENABLED", False):
+        ctx = _server_ssl_context(getattr(settings, "TLS_CERT_FILE", ""), getattr(settings, "TLS_KEY_FILE", ""))
+        if ctx is not None:
+            try:
+                httpsd = BaseHTTPServer.ThreadingHTTPServer((settings.HOST, settings.HTTPS_PORT), KVHandler)
+                httpsd.socket = ctx.wrap_socket(httpsd.socket, server_side=True)
+                https_thread = threading.Thread(target=httpsd.serve_forever, daemon=True)
+                https_thread.start()
+                logging.info("Serving on https://%s:%d", settings.HOST, settings.HTTPS_PORT)
+            except Exception as e:
+                logging.warning("Failed to start HTTPS listener: %s", e)
+                try:
+                    if httpsd is not None:
+                        httpsd.server_close()
+                except Exception:
+                    pass
+                httpsd = None
+
     def stop(sig: int, _frame: Any) -> None:
         logging.info("Shutting down (%s)…", sig)
+        if httpsd is not None:
+            try:
+                httpsd.shutdown()
+            except Exception:
+                pass
+            try:
+                httpsd.server_close()
+            except Exception:
+                pass
         httpd.shutdown()
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
         sys.exit(0)
 
     def reload_config(sig: int, _frame: Any) -> None:

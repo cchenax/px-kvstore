@@ -6,6 +6,7 @@ import threading
 import logging
 import time
 import json
+import ssl
 from queue import Empty
 from typing import Any, List, Optional
 
@@ -44,11 +45,12 @@ def encode_array(arr: List[Any]) -> bytes:
     return res
 
 class RedisServer(threading.Thread):
-    def __init__(self, store, host="0.0.0.0", port=6379):
+    def __init__(self, store, host="0.0.0.0", port=6379, ssl_context: Optional[ssl.SSLContext] = None):
         super().__init__(daemon=True)
         self.store = store
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
         self._stop_event = threading.Event()
         self.server_socket = None
 
@@ -64,7 +66,8 @@ class RedisServer(threading.Thread):
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(128)
             self.server_socket.settimeout(1.0)
-            logging.info("Redis compatible server listening on %s:%d", self.host, self.port)
+            scheme = "rediss" if self.ssl_context else "redis"
+            logging.info("Redis compatible server listening on %s://%s:%d", scheme, self.host, self.port)
         except Exception as e:
             logging.error("Failed to start Redis server: %s", e)
             return
@@ -72,6 +75,16 @@ class RedisServer(threading.Thread):
         while not self._stop_event.is_set():
             try:
                 conn, addr = self.server_socket.accept()
+                if self.ssl_context is not None:
+                    try:
+                        conn = self.ssl_context.wrap_socket(conn, server_side=True)
+                    except Exception as e:
+                        logging.warning("Redis TLS handshake failed from %s: %s", addr, e)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
                 client_thread = threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True)
                 client_thread.start()
             except socket.timeout:

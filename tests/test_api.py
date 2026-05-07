@@ -6,6 +6,9 @@ import urllib.request
 import urllib.error
 import gzip
 import threading
+import ssl
+import socket
+import shutil
 
 import pytest
 
@@ -184,5 +187,86 @@ def test_rate_limiting_per_route_admin_configurable():
 
         with urllib.request.urlopen(f"{base}/admin/health", timeout=2.0) as resp:
             assert resp.status == 200
+    finally:
+        stop_proc(proc)
+
+
+def test_tls_https_and_rediss(tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available")
+
+    cert_file = tmp_path / "cert.pem"
+    key_file = tmp_path / "key.pem"
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key_file),
+                "-out",
+                str(cert_file),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pytest.skip("failed to generate self-signed cert with openssl")
+
+    http_port = get_free_port()
+    https_port = get_free_port()
+    rediss_port = get_free_port()
+
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(http_port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_HTTP_TLS_ENABLED"] = "true"
+    env["PXKV_HTTPS_PORT"] = str(https_port)
+    env["PXKV_TLS_CERT_FILE"] = str(cert_file)
+    env["PXKV_TLS_KEY_FILE"] = str(key_file)
+    env["PXKV_REDIS_TLS_ENABLED"] = "true"
+    env["PXKV_REDIS_TLS_PORT"] = str(rediss_port)
+    env["PXKV_REDIS_TLS_CERT_FILE"] = str(cert_file)
+    env["PXKV_REDIS_TLS_KEY_FILE"] = str(key_file)
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    try:
+        https_base = f"https://localhost:{https_port}"
+        deadline = time.time() + 8.0
+        ctx = ssl._create_unverified_context()
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{https_base}/admin/health", timeout=1.0, context=ctx) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        with urllib.request.urlopen(f"{https_base}/admin/health", timeout=2.0, context=ctx) as resp:
+            assert resp.status == 200
+
+        raw = b"*1\r\n$4\r\nPING\r\n"
+        sock = socket.create_connection(("127.0.0.1", rediss_port), timeout=2.0)
+        try:
+            with ctx.wrap_socket(sock, server_hostname="localhost") as ssock:
+                ssock.sendall(raw)
+                data = ssock.recv(1024)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        assert b"+PONG" in data
     finally:
         stop_proc(proc)

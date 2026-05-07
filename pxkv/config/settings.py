@@ -18,6 +18,10 @@ class Settings:
 
             self.HOST = os.getenv("PXKV_HOST", "0.0.0.0")
             self.PORT = int(os.getenv("PXKV_PORT", "8000"))
+            self.HTTP_TLS_ENABLED = os.getenv("PXKV_HTTP_TLS_ENABLED", "false").lower() == "true"
+            self.HTTPS_PORT = int(os.getenv("PXKV_HTTPS_PORT", "8443") or "8443")
+            self.TLS_CERT_FILE = os.getenv("PXKV_TLS_CERT_FILE", "")
+            self.TLS_KEY_FILE = os.getenv("PXKV_TLS_KEY_FILE", "")
             self.SHARDS = int(os.getenv("PXKV_SHARD_COUNT", os.getenv("SHARD_COUNT", "4")))
             self.PER_SHARD_MAX = int(os.getenv("PXKV_PER_SHARD_MAX", "1000"))
             self.EVICTION_POLICY = os.getenv("PXKV_EVICTION_POLICY", "lru")
@@ -34,6 +38,10 @@ class Settings:
             self.REDIS_HOST = os.getenv("PXKV_REDIS_HOST", "0.0.0.0")
             self.REDIS_PORT = int(os.getenv("PXKV_REDIS_PORT", "6379"))
             self.REDIS_ENABLED = os.getenv("PXKV_REDIS_ENABLED", "true").lower() == "true"
+            self.REDIS_TLS_ENABLED = os.getenv("PXKV_REDIS_TLS_ENABLED", "false").lower() == "true"
+            self.REDIS_TLS_PORT = int(os.getenv("PXKV_REDIS_TLS_PORT", "6380") or "6380")
+            self.REDIS_TLS_CERT_FILE = os.getenv("PXKV_REDIS_TLS_CERT_FILE", self.TLS_CERT_FILE)
+            self.REDIS_TLS_KEY_FILE = os.getenv("PXKV_REDIS_TLS_KEY_FILE", self.TLS_KEY_FILE)
 
             self.TIERING_DIR = os.getenv("PXKV_TIERING_DIR", "")
             self.TIERING_BACKEND = os.getenv("PXKV_TIERING_BACKEND", "file" if self.TIERING_DIR else "").lower()
