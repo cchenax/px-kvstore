@@ -7,8 +7,9 @@ import logging
 import time
 import json
 import ssl
+from collections import OrderedDict
 from queue import Empty
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from ..metrics.registry import registry
 from ..config.settings import settings
@@ -36,13 +37,66 @@ def encode_array(arr: List[Any]) -> bytes:
         return b"*-1\r\n"
     res = f"*{len(arr)}\r\n".encode("utf-8")
     for item in arr:
-        if isinstance(item, int):
+        if isinstance(item, list):
+            res += encode_array(item)
+        elif isinstance(item, int):
             res += encode_integer(item)
         elif item is None:
             res += encode_bulk_string(None)
         else:
             res += encode_bulk_string(item)
     return res
+
+class _ScanCursorRegistry:
+    """Bounded LRU map of integer cursor IDs → (shard_idx, start_after).
+
+    Redis SCAN requires an integer cursor; our internal scan state is
+    (shard_idx, start_after_key). This registry materializes the mapping
+    server-side so clients can iterate with a plain int cursor without
+    revealing key contents to them.
+    """
+
+    def __init__(self, max_entries: int = 4096, ttl_seconds: float = 300.0):
+        self._max = max_entries
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        self._next_id = 1
+        self._entries: "OrderedDict[int, Tuple[int, Optional[str], float]]" = OrderedDict()
+
+    def alloc(self, shard_idx: int, start_after: Optional[str]) -> int:
+        now = time.time()
+        with self._lock:
+            self._gc_locked(now)
+            cid = self._next_id
+            self._next_id += 1
+            if self._next_id > (1 << 62):
+                self._next_id = 1
+            self._entries[cid] = (shard_idx, start_after, now + self._ttl)
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)
+            return cid
+
+    def take(self, cursor_id: int) -> Optional[Tuple[int, Optional[str]]]:
+        if cursor_id <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            self._gc_locked(now)
+            entry = self._entries.pop(cursor_id, None)
+            if entry is None:
+                return None
+            shard_idx, start_after, exp = entry
+            if exp < now:
+                return None
+            return shard_idx, start_after
+
+    def _gc_locked(self, now: float) -> None:
+        while self._entries:
+            cid, entry = next(iter(self._entries.items()))
+            if entry[2] >= now:
+                break
+            self._entries.popitem(last=False)
+
 
 class RedisServer(threading.Thread):
     def __init__(self, store, host="0.0.0.0", port=6379, ssl_context: Optional[ssl.SSLContext] = None):
@@ -53,6 +107,7 @@ class RedisServer(threading.Thread):
         self.ssl_context = ssl_context
         self._stop_event = threading.Event()
         self.server_socket = None
+        self._scan_cursors = _ScanCursorRegistry()
 
     def stop(self):
         self._stop_event.set()
@@ -225,7 +280,7 @@ class RedisServer(threading.Thread):
         )
 
     def _required_role_for_cmd(self, cmd: str) -> str:
-        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE"):
+        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE", "SCAN"):
             return ROLE_READER
         if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST", "FLUSHALL"):
             return ROLE_WRITER
@@ -398,6 +453,54 @@ class RedisServer(threading.Thread):
 
             elif cmd == "DBSIZE":
                 return encode_integer(len(self.store.keys())), role
+
+            elif cmd == "SCAN":
+                if len(args) < 2:
+                    return encode_error("ERR wrong number of arguments for 'SCAN' command"), role
+                try:
+                    cursor_in = int(args[1].decode("utf-8"))
+                except ValueError:
+                    return encode_error("ERR invalid cursor"), role
+
+                match: Optional[str] = None
+                count = 10
+                i = 2
+                while i < len(args):
+                    opt = args[i].decode("utf-8", errors="replace").upper()
+                    if opt == "MATCH" and i + 1 < len(args):
+                        match = args[i + 1].decode("utf-8", errors="replace")
+                        i += 2
+                    elif opt == "COUNT" and i + 1 < len(args):
+                        try:
+                            count = int(args[i + 1].decode("utf-8"))
+                        except ValueError:
+                            return encode_error("ERR value is not an integer or out of range"), role
+                        i += 2
+                    elif opt == "TYPE" and i + 1 < len(args):
+                        t = args[i + 1].decode("utf-8", errors="replace").lower()
+                        if t not in ("string", ""):
+                            return encode_array([b"0", []]), role
+                        i += 2
+                    else:
+                        return encode_error("ERR syntax error"), role
+
+                if cursor_in == 0:
+                    shard_idx: int = 0
+                    start_after: Optional[str] = None
+                else:
+                    st = self._scan_cursors.take(cursor_in)
+                    if st is None:
+                        return encode_array([b"0", []]), role
+                    shard_idx, start_after = st
+
+                next_idx, next_after, keys = self.store._scan_step(
+                    shard_idx, start_after, match=match, count=count
+                )
+                if next_idx is None:
+                    next_cursor_bytes = b"0"
+                else:
+                    next_cursor_bytes = str(self._scan_cursors.alloc(next_idx, next_after)).encode("utf-8")
+                return encode_array([next_cursor_bytes, keys]), role
 
             elif cmd == "FLUSHALL":
                 for shard in self.store._shards:

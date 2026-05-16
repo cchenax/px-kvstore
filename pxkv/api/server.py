@@ -790,10 +790,42 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if len(parts) >= 2 and parts[1] == "scan":
                 prefix = None
-                start_after = None
-                limit = 100
                 if "prefix" in query:
                     prefix = query["prefix"][0]
+
+                extra = getattr(self, "_fallback_headers", None)
+                headers = self._staleness_headers()
+                if isinstance(extra, dict):
+                    headers = {**headers, **extra}
+                    self._fallback_headers = None
+
+                if "cursor" in query:
+                    cursor_in = query["cursor"][0]
+                    match = query["match"][0] if "match" in query else None
+                    count = 100
+                    if "count" in query:
+                        try:
+                            count = int(query["count"][0])
+                        except ValueError:
+                            self._send(400, "count must be int")
+                            self._inc_metrics("GET", route="GET /kv/scan", error=True)
+                            return
+                    elif "limit" in query:
+                        try:
+                            count = int(query["limit"][0])
+                        except ValueError:
+                            self._send(400, "limit must be int")
+                            self._inc_metrics("GET", route="GET /kv/scan", error=True)
+                            return
+                    next_cursor, keys = STORE.scan_cursor(
+                        cursor_in, match=match, count=count, prefix=prefix
+                    )
+                    self._json(200, {"cursor": next_cursor, "keys": keys}, headers=headers)
+                    self._inc_metrics("GET", route="GET /kv/scan")
+                    return
+
+                start_after = None
+                limit = 100
                 if "start_after" in query:
                     start_after = query["start_after"][0]
                 if "limit" in query:
@@ -804,11 +836,6 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._inc_metrics("GET", route="GET /kv/scan", error=True)
                         return
                 keys = STORE.scan(prefix=prefix, limit=limit, start_after=start_after)
-                extra = getattr(self, "_fallback_headers", None)
-                headers = self._staleness_headers()
-                if isinstance(extra, dict):
-                    headers = {**headers, **extra}
-                    self._fallback_headers = None
                 self._json(200, {"keys": keys}, headers=headers)
                 self._inc_metrics("GET", route="GET /kv/scan")
                 return

@@ -56,6 +56,60 @@ def test_redis_flushall(r_client):
     assert r_client.dbsize() == 0
 
 
+def test_redis_scan_full_traversal(r_client):
+    r_client.flushall()
+    expected = {f"scan:{i:03d}" for i in range(75)}
+    for k in expected:
+        r_client.set(k, "1")
+
+    seen: set[str] = set()
+    cursor = 0
+    steps = 0
+    while True:
+        cursor, batch = r_client.scan(cursor=cursor, count=20)
+        seen.update(batch)
+        steps += 1
+        if cursor == 0:
+            break
+        assert steps < 1000
+
+    assert expected.issubset(seen)
+
+
+def test_redis_scan_match(r_client):
+    r_client.flushall()
+    for i in range(10):
+        r_client.set(f"u:{i}", "1")
+        r_client.set(f"p:{i}", "1")
+
+    seen: set[str] = set()
+    cursor = 0
+    while True:
+        cursor, batch = r_client.scan(cursor=cursor, match="u:*", count=5)
+        seen.update(batch)
+        if cursor == 0:
+            break
+
+    assert seen == {f"u:{i}" for i in range(10)}
+
+
+def test_redis_scan_iter(r_client):
+    r_client.flushall()
+    expected = {f"iter:{i}" for i in range(50)}
+    for k in expected:
+        r_client.set(k, "x")
+    got = set(r_client.scan_iter(match="iter:*", count=7))
+    assert got == expected
+
+
+def test_redis_scan_unknown_cursor_terminates(r_client):
+    r_client.flushall()
+    r_client.set("a", "1")
+    cursor, batch = r_client.scan(cursor=999999999, count=10)
+    assert cursor == 0
+    assert batch == []
+
+
 def test_redis_pubsub_keyspace_notifications(r_client):
     p = r_client.pubsub()
     p.subscribe("pxkv:keyspace", "pxkv:keyspace:expire")

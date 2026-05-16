@@ -130,6 +130,40 @@ def test_sse_keyspace_notifications(http_server):
     assert ev["key"] == "sse_test_key"
 
 
+def test_kv_scan_cursor_pagination(http_server):
+    expected: set[str] = set()
+    for i in range(40):
+        k = f"hscan:{i:03d}"
+        expected.add(k)
+        req = urllib.request.Request(
+            f"{http_server}/kv/{k}",
+            data=json.dumps({"value": str(i)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            assert resp.status in (200, 201)
+
+    seen: set[str] = set()
+    cursor = "0"
+    steps = 0
+    while True:
+        url = f"{http_server}/kv/scan?cursor={urllib.parse.quote(cursor)}&match=hscan:*&count=7"
+        with urllib.request.urlopen(url, timeout=2.0) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+        assert "cursor" in body
+        assert "keys" in body
+        seen.update(body["keys"])
+        cursor = body["cursor"]
+        steps += 1
+        if cursor == "0":
+            break
+        assert steps < 1000
+
+    assert expected.issubset(seen)
+
+
 def test_rate_limiting_per_route_admin_configurable():
     port = get_free_port()
     env = os.environ.copy()

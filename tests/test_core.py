@@ -92,6 +92,64 @@ class TestShardedStore:
         k2 = "user:{42}:settings"
         assert sharded_store.shard_for_key(k1) == sharded_store.shard_for_key(k2)
 
+    def test_scan_cursor_full_traversal(self):
+        store = ShardedKeyValueStore(shards=4, per_shard_max=1000)
+        items = {f"k{i:04d}": i for i in range(200)}
+        store.mset(items)
+
+        seen: list[str] = []
+        cursor = "0"
+        steps = 0
+        while True:
+            cursor, keys = store.scan_cursor(cursor, count=30)
+            seen.extend(keys)
+            steps += 1
+            if cursor == "0":
+                break
+            assert steps < 1000, "cursor did not terminate"
+
+        assert sorted(seen) == sorted(items.keys())
+        assert len(seen) == len(set(seen)), "cursor must not yield duplicates within a single pass"
+
+    def test_scan_cursor_match_filter(self):
+        store = ShardedKeyValueStore(shards=3, per_shard_max=1000)
+        store.mset({"user:1": 1, "user:2": 2, "post:1": 3, "user:3": 4, "post:2": 5})
+
+        seen: list[str] = []
+        cursor = "0"
+        while True:
+            cursor, keys = store.scan_cursor(cursor, match="user:*", count=2)
+            seen.extend(keys)
+            if cursor == "0":
+                break
+        assert sorted(seen) == ["user:1", "user:2", "user:3"]
+
+    def test_scan_cursor_prefix(self):
+        store = ShardedKeyValueStore(shards=3, per_shard_max=1000)
+        store.mset({"foo": 1, "foo2": 2, "bar": 3, "fop": 4, "baz": 5})
+
+        seen: list[str] = []
+        cursor = "0"
+        while True:
+            cursor, keys = store.scan_cursor(cursor, prefix="fo", count=1)
+            seen.extend(keys)
+            if cursor == "0":
+                break
+        assert sorted(seen) == ["foo", "foo2", "fop"]
+
+    def test_scan_cursor_empty_store(self):
+        store = ShardedKeyValueStore(shards=2, per_shard_max=10)
+        cursor, keys = store.scan_cursor("0", count=10)
+        assert cursor == "0"
+        assert keys == []
+
+    def test_scan_cursor_invalid_cursor_restarts(self):
+        store = ShardedKeyValueStore(shards=2, per_shard_max=10)
+        store.mset({"a": 1, "b": 2})
+        cursor, keys = store.scan_cursor("not-a-valid-cursor", count=10)
+        assert sorted(keys) == ["a", "b"]
+        assert cursor == "0"
+
 
 def test_tiering_spill_and_promote_lru():
     with tempfile.TemporaryDirectory() as d:

@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import base64
 import binascii
+import fnmatch
 import heapq
 import bisect
+import json
 from collections import defaultdict
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -269,6 +272,124 @@ class ShardedKeyValueStore(object):
                 continue
             heapq.heappush(heap, (nxt, i))
         return out
+
+    _CURSOR_VERSION = 1
+
+    def _encode_cursor(self, shard_idx: int, start_after: Optional[str]) -> str:
+        payload: Dict[str, Any] = {"v": self._CURSOR_VERSION, "s": int(shard_idx)}
+        if start_after is not None:
+            payload["k"] = start_after
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    def _decode_cursor(self, cursor: Optional[str]) -> Tuple[int, Optional[str]]:
+        if cursor is None or cursor == "" or cursor == "0":
+            return 0, None
+        try:
+            pad = "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode((cursor + pad).encode("ascii"))
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return 0, None
+        if not isinstance(payload, dict):
+            return 0, None
+        if int(payload.get("v", 0)) != self._CURSOR_VERSION:
+            return 0, None
+        try:
+            s = int(payload.get("s", 0))
+        except (TypeError, ValueError):
+            return 0, None
+        if s < 0 or s > len(self._shards):
+            return 0, None
+        k = payload.get("k")
+        if k is not None and not isinstance(k, str):
+            k = None
+        return s, k
+
+    def _scan_step(
+        self,
+        shard_idx: int,
+        start_after: Optional[str],
+        *,
+        match: Optional[str] = None,
+        count: int = 100,
+        prefix: Optional[str] = None,
+    ) -> Tuple[Optional[int], Optional[str], List[str]]:
+        """Advance one SCAN step from (shard_idx, start_after).
+
+        Returns (next_shard_idx, next_start_after, keys). next_shard_idx is
+        None when iteration has finished — callers should treat that as the
+        terminal state.
+        """
+        try:
+            examined_limit = int(count)
+        except (TypeError, ValueError):
+            examined_limit = 100
+        if examined_limit < 1:
+            examined_limit = 1
+
+        if shard_idx < 0:
+            shard_idx = 0
+            start_after = None
+
+        out: List[str] = []
+        examined = 0
+
+        while shard_idx < len(self._shards) and examined < examined_limit:
+            shard = self._shards[shard_idx]
+            it = shard.iter_string_keys_sorted(prefix=prefix, start_after=start_after)
+            last_key = start_after
+            shard_done = True
+            for k in it:
+                examined += 1
+                last_key = k
+                if match is None or fnmatch.fnmatchcase(k, match):
+                    out.append(k)
+                if examined >= examined_limit:
+                    shard_done = False
+                    break
+
+            if shard_done:
+                shard_idx += 1
+                start_after = None
+            else:
+                start_after = last_key
+                break
+
+        if shard_idx >= len(self._shards):
+            return None, None, out
+        return shard_idx, start_after, out
+
+    def scan_cursor(
+        self,
+        cursor: str = "0",
+        *,
+        match: Optional[str] = None,
+        count: int = 100,
+        prefix: Optional[str] = None,
+    ) -> Tuple[str, List[str]]:
+        """Cursor-based SCAN over the global keyspace.
+
+        Returns (next_cursor, keys). A returned cursor of "0" indicates
+        iteration has finished. Cursors are opaque tokens — callers must
+        treat them as bytes and only pass them back unchanged.
+
+        - cursor: pass "0" (or empty) to start; otherwise the value returned
+          by the previous call.
+        - match: optional Redis-style glob applied to keys (post-filter).
+        - count: hint on how many keys to examine per call; the number of
+          returned keys may be lower if MATCH filters some out, or higher
+          if a shard yields extras to make progress.
+        - prefix: optional prefix filter; uses the sorted index for O(log n)
+          positioning rather than a full scan.
+        """
+        shard_idx, start_after = self._decode_cursor(cursor)
+        next_idx, next_after, keys = self._scan_step(
+            shard_idx, start_after, match=match, count=count, prefix=prefix
+        )
+        if next_idx is None:
+            return "0", keys
+        return self._encode_cursor(next_idx, next_after), keys
 
     def dump(self) -> Dict[str, Dict[str, Any]]:
         with self._write_lock:
