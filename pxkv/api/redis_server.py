@@ -39,7 +39,9 @@ def encode_array(arr: List[Any]) -> bytes:
         return b"*-1\r\n"
     res = f"*{len(arr)}\r\n".encode("utf-8")
     for item in arr:
-        if isinstance(item, int):
+        if isinstance(item, list):
+            res += encode_array(item)
+        elif isinstance(item, int):
             res += encode_integer(item)
         elif item is None:
             res += encode_bulk_string(None)
@@ -224,13 +226,22 @@ class RedisServer(threading.Thread):
         return namespace_manager.role_for_secret(namespace, secret)
 
     def _required_role_for_cmd(self, cmd: str) -> str:
-        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE"):
+        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE", "XRANGE", "XREAD", "XPENDING"):
             return ROLE_READER
-        if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST", "FLUSHALL"):
+        if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST", "FLUSHALL", "XADD", "XGROUP", "XREADGROUP", "XACK"):
             return ROLE_WRITER
         if cmd == "AUTH":
             return ROLE_READER
         return ROLE_ADMIN
+
+    def _stream_entries_resp(self, entries: List[dict]) -> List[Any]:
+        out: List[Any] = []
+        for entry in entries:
+            flat: List[Any] = []
+            for k, v in (entry.get("fields", {}) or {}).items():
+                flat.extend([k, v])
+            out.append([entry.get("id"), flat])
+        return out
 
     def handle_command(
         self,
@@ -257,6 +268,10 @@ class RedisServer(threading.Thread):
                 "EXPIRE",
                 "PERSIST",
                 "FLUSHALL",
+                "XADD",
+                "XGROUP",
+                "XREADGROUP",
+                "XACK",
             ):
                 return encode_error("READONLY You can't write against a read-only follower."), role, namespace
 
@@ -267,7 +282,7 @@ class RedisServer(threading.Thread):
                 if not role_satisfies(role, required):
                     return encode_error("NOPERM this user has no permissions to run the command"), role, namespace
 
-            if cmd in ("SET", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST"):
+            if cmd in ("SET", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST", "XADD", "XGROUP", "XREADGROUP", "XACK"):
                 decision = disk_throttler.gate_write()
                 registry.observe_disk_usage(decision)
                 delay_ms = float(decision.get("delay_ms", 0.0) or 0.0)
@@ -347,6 +362,153 @@ class RedisServer(threading.Thread):
                     except KeyError:
                         pass
                 return encode_integer(count), role, namespace
+
+            elif cmd == "XADD":
+                if len(args) < 5:
+                    return encode_error("ERR wrong number of arguments for 'XADD' command"), role, namespace
+                key = namespace_manager.key(namespace, sargs[1])
+                idx = 2
+                maxlen = None
+                if sargs[idx].upper() == "MAXLEN":
+                    idx += 1
+                    if idx < len(args) and sargs[idx] == "~":
+                        idx += 1
+                    if idx >= len(args):
+                        return encode_error("ERR syntax error"), role, namespace
+                    maxlen = int(sargs[idx])
+                    idx += 1
+                if idx >= len(args):
+                    return encode_error("ERR syntax error"), role, namespace
+                entry_id = sargs[idx]
+                idx += 1
+                if (len(args) - idx) <= 0 or (len(args) - idx) % 2 != 0:
+                    return encode_error("ERR wrong number of arguments for 'XADD' command"), role, namespace
+                fields = {}
+                while idx < len(args):
+                    fields[sargs[idx]] = sargs[idx + 1]
+                    idx += 2
+                try:
+                    new_id = self.store.stream_xadd(key, fields, entry_id=entry_id, maxlen=maxlen)
+                except ValueError as e:
+                    return encode_error(f"ERR {e}"), role, namespace
+                return encode_bulk_string(new_id), role, namespace
+
+            elif cmd == "XRANGE":
+                if len(args) not in (4, 6):
+                    return encode_error("ERR wrong number of arguments for 'XRANGE' command"), role, namespace
+                key = namespace_manager.key(namespace, sargs[1])
+                count = None
+                if len(args) == 6:
+                    if sargs[4].upper() != "COUNT":
+                        return encode_error("ERR syntax error"), role, namespace
+                    count = int(sargs[5])
+                entries = self.store.stream_xrange(key, start=sargs[2], end=sargs[3], count=count)
+                return encode_array(self._stream_entries_resp(entries)), role, namespace
+
+            elif cmd == "XREAD":
+                idx = 1
+                count = None
+                block_ms = 0
+                while idx < len(args) and sargs[idx].upper() != "STREAMS":
+                    opt = sargs[idx].upper()
+                    if opt == "COUNT" and idx + 1 < len(args):
+                        count = int(sargs[idx + 1])
+                        idx += 2
+                    elif opt == "BLOCK" and idx + 1 < len(args):
+                        block_ms = int(sargs[idx + 1])
+                        idx += 2
+                    else:
+                        return encode_error("ERR syntax error"), role, namespace
+                if idx >= len(args) or sargs[idx].upper() != "STREAMS":
+                    return encode_error("ERR syntax error"), role, namespace
+                idx += 1
+                remaining = len(args) - idx
+                if remaining <= 0 or remaining % 2 != 0:
+                    return encode_error("ERR Unbalanced XREAD list of streams"), role, namespace
+                half = remaining // 2
+                keys = sargs[idx : idx + half]
+                ids = sargs[idx + half :]
+                streams = {namespace_manager.key(namespace, k): v for k, v in zip(keys, ids)}
+                result = self.store.stream_xread(streams, count=count, block_ms=block_ms)
+                if not result:
+                    return encode_bulk_string(None), role, namespace
+                resp = []
+                for raw_key, entries in result.items():
+                    resp.append([namespace_manager.strip(namespace, raw_key), self._stream_entries_resp(entries)])
+                return encode_array(resp), role, namespace
+
+            elif cmd == "XGROUP":
+                if len(args) < 5 or sargs[1].upper() != "CREATE":
+                    return encode_error("ERR only XGROUP CREATE is supported"), role, namespace
+                key = namespace_manager.key(namespace, sargs[2])
+                group = sargs[3]
+                entry_id = sargs[4]
+                mkstream = any(arg.upper() == "MKSTREAM" for arg in sargs[5:])
+                try:
+                    self.store.stream_xgroup_create(key, group, entry_id=entry_id, mkstream=mkstream)
+                except KeyError:
+                    return encode_error("BUSYGROUP Consumer Group name already exists or stream does not exist"), role, namespace
+                except ValueError as e:
+                    return encode_error(f"ERR {e}"), role, namespace
+                return encode_simple_string("OK"), role, namespace
+
+            elif cmd == "XREADGROUP":
+                if len(args) < 8 or sargs[1].upper() != "GROUP":
+                    return encode_error("ERR syntax error"), role, namespace
+                group = sargs[2]
+                consumer = sargs[3]
+                idx = 4
+                count = None
+                block_ms = 0
+                while idx < len(args) and sargs[idx].upper() != "STREAMS":
+                    opt = sargs[idx].upper()
+                    if opt == "COUNT" and idx + 1 < len(args):
+                        count = int(sargs[idx + 1])
+                        idx += 2
+                    elif opt == "BLOCK" and idx + 1 < len(args):
+                        block_ms = int(sargs[idx + 1])
+                        idx += 2
+                    else:
+                        return encode_error("ERR syntax error"), role, namespace
+                if idx >= len(args) or sargs[idx].upper() != "STREAMS":
+                    return encode_error("ERR syntax error"), role, namespace
+                idx += 1
+                remaining = len(args) - idx
+                if remaining <= 0 or remaining % 2 != 0:
+                    return encode_error("ERR Unbalanced XREADGROUP list of streams"), role, namespace
+                half = remaining // 2
+                keys = sargs[idx : idx + half]
+                ids = sargs[idx + half :]
+                resp = []
+                try:
+                    for stream_key, entry_id in zip(keys, ids):
+                        raw_key = namespace_manager.key(namespace, stream_key)
+                        entries = self.store.stream_xreadgroup(raw_key, group, consumer, entry_id=entry_id, count=count, block_ms=block_ms)
+                        if entries:
+                            resp.append([stream_key, self._stream_entries_resp(entries)])
+                except KeyError as e:
+                    return encode_error(f"NOGROUP {e}"), role, namespace
+                if not resp:
+                    return encode_bulk_string(None), role, namespace
+                return encode_array(resp), role, namespace
+
+            elif cmd == "XACK":
+                if len(args) < 4:
+                    return encode_error("ERR wrong number of arguments for 'XACK' command"), role, namespace
+                key = namespace_manager.key(namespace, sargs[1])
+                count = self.store.stream_xack(key, sargs[2], sargs[3:])
+                return encode_integer(count), role, namespace
+
+            elif cmd == "XPENDING":
+                if len(args) != 3:
+                    return encode_error("ERR wrong number of arguments for 'XPENDING' command"), role, namespace
+                key = namespace_manager.key(namespace, sargs[1])
+                try:
+                    summary = self.store.stream_xpending(key, sargs[2])
+                except KeyError as e:
+                    return encode_error(f"NOGROUP {e}"), role, namespace
+                consumers = [[name, count] for name, count in summary.get("consumers", {}).items()]
+                return encode_array([summary.get("count", 0), summary.get("min"), summary.get("max"), consumers]), role, namespace
             
             elif cmd == "EXISTS":
                 if len(args) < 2:

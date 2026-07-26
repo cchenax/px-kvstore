@@ -242,6 +242,12 @@ class ReplicationManager:
                                 except Exception:
                                     logging.warning("Failed to load vector index from snapshot")
                                 continue
+                            if "streams" in rec and isinstance(rec.get("streams"), dict):
+                                try:
+                                    self.store._streams.load(rec["streams"])
+                                except Exception:
+                                    logging.warning("Failed to load streams from snapshot")
+                                continue
                             shard_idx = rec.get("shard")
                             state = rec.get("state")
                             if shard_idx is None or state is None:
@@ -549,6 +555,49 @@ class ReplicationManager:
                     )
                 elif op == "vector_delete":
                     self.store.vector_delete(key, skip_replication=True)
+                elif op == "stream_xadd":
+                    payload = val if isinstance(val, dict) else {}
+                    self.store.stream_xadd(
+                        key,
+                        payload.get("fields", {}),
+                        entry_id=str(payload.get("id", "*")),
+                        maxlen=payload.get("maxlen"),
+                        skip_replication=True,
+                    )
+                elif op == "stream_xgroup_create":
+                    payload = val if isinstance(val, dict) else {}
+                    try:
+                        self.store.stream_xgroup_create(
+                            key,
+                            str(payload.get("group", "")),
+                            entry_id=str(payload.get("id", "$")),
+                            mkstream=bool(payload.get("mkstream", False)),
+                            skip_replication=True,
+                        )
+                    except KeyError:
+                        pass
+                elif op == "stream_xack":
+                    payload = val if isinstance(val, dict) else {}
+                    self.store.stream_xack(
+                        key,
+                        str(payload.get("group", "")),
+                        payload.get("ids", []) or [],
+                        skip_replication=True,
+                    )
+                elif op == "stream_xdeliver":
+                    payload = val if isinstance(val, dict) else {}
+                    try:
+                        self.store.stream_xdeliver(
+                            key,
+                            str(payload.get("group", "")),
+                            str(payload.get("consumer", "")),
+                            payload.get("ids", []) or [],
+                            skip_replication=True,
+                        )
+                    except KeyError:
+                        pass
+                elif op == "stream_delete":
+                    self.store.stream_delete(key, skip_replication=True)
 
                 self._last_applied_lsn = lsn
                 last_applied = True

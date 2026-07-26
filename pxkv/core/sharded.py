@@ -19,6 +19,7 @@ from .adaptive_ttl import AdaptiveTTLController
 from .cold_eviction import ColdKeyEvictionHints
 from .heavy_hitters import TopKHeavyHitters
 from .vector import HNSWVectorIndex, normalize_vector
+from .streams import StreamStore
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -136,6 +137,7 @@ class ShardedKeyValueStore(object):
             ef_construction=getattr(settings, "VECTOR_INDEX_EF_CONSTRUCTION", 64),
             ef_search=getattr(settings, "VECTOR_INDEX_EF_SEARCH", 64),
         )
+        self._streams = StreamStore()
         self._replication = ReplicationManager(self)
         self._hotkeys = HotKeyDetector(
             enabled=getattr(settings, "HOT_KEY_DETECTION_ENABLED", False),
@@ -635,6 +637,158 @@ class ShardedKeyValueStore(object):
     def vector_stats(self) -> Dict[str, Any]:
         return self._vector_index.stats()
 
+    def stream_xadd(
+        self,
+        key: Any,
+        fields: Dict[str, Any],
+        *,
+        entry_id: str = "*",
+        maxlen: Optional[int] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> str:
+        with self._write_lock:
+            new_id = self._streams.xadd(key, fields, entry_id=entry_id, maxlen=maxlen)
+            payload = {"fields": fields, "id": new_id, "maxlen": maxlen}
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("stream_xadd", key, payload)
+            if not skip_replication:
+                self._replication.enqueue_change("stream_xadd", key, payload, lsn=lsn)
+            notifier.publish("stream", key, lsn=lsn, shard=self._idx(key))
+            return new_id
+
+    def stream_xrange(
+        self,
+        key: Any,
+        *,
+        start: str = "-",
+        end: str = "+",
+        count: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        return self._streams.xrange(key, start=start, end=end, count=count)
+
+    def stream_xread(
+        self,
+        streams: Dict[Any, str],
+        *,
+        count: Optional[int] = None,
+        block_ms: int = 0,
+    ) -> Dict[Any, List[Dict[str, Any]]]:
+        return self._streams.xread(streams, count=count, block_ms=block_ms)
+
+    def stream_xgroup_create(
+        self,
+        key: Any,
+        group: str,
+        *,
+        entry_id: str = "$",
+        mkstream: bool = False,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> bool:
+        with self._write_lock:
+            ok = self._streams.xgroup_create(key, group, entry_id=entry_id, mkstream=mkstream)
+            payload = {"group": group, "id": entry_id, "mkstream": mkstream}
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("stream_xgroup_create", key, payload)
+            if not skip_replication:
+                self._replication.enqueue_change("stream_xgroup_create", key, payload, lsn=lsn)
+            return ok
+
+    def stream_xreadgroup(
+        self,
+        key: Any,
+        group: str,
+        consumer: str,
+        *,
+        entry_id: str = ">",
+        count: Optional[int] = None,
+        block_ms: int = 0,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> List[Dict[str, Any]]:
+        entries = self._streams.xreadgroup(key, group, consumer, entry_id=entry_id, count=count, block_ms=block_ms)
+        delivered_ids = [entry["id"] for entry in entries]
+        if entry_id == ">" and delivered_ids:
+            payload = {"group": group, "consumer": consumer, "ids": delivered_ids}
+            lsn = 0
+            with self._write_lock:
+                if not skip_wal:
+                    lsn = self._wal.log("stream_xdeliver", key, payload)
+                if not skip_replication:
+                    self._replication.enqueue_change("stream_xdeliver", key, payload, lsn=lsn)
+            notifier.publish("stream", key, lsn=lsn, shard=self._idx(key))
+        return entries
+
+    def stream_xdeliver(
+        self,
+        key: Any,
+        group: str,
+        consumer: str,
+        ids: Iterable[str],
+        *,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> int:
+        with self._write_lock:
+            id_list = [str(entry_id) for entry_id in ids]
+            count = self._streams.mark_delivered(key, group, consumer, id_list)
+            if count > 0:
+                payload = {"group": group, "consumer": consumer, "ids": id_list}
+                lsn = 0
+                if not skip_wal:
+                    lsn = self._wal.log("stream_xdeliver", key, payload)
+                if not skip_replication:
+                    self._replication.enqueue_change("stream_xdeliver", key, payload, lsn=lsn)
+                notifier.publish("stream", key, lsn=lsn, shard=self._idx(key))
+            return count
+
+    def stream_xack(
+        self,
+        key: Any,
+        group: str,
+        ids: Iterable[str],
+        *,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> int:
+        with self._write_lock:
+            id_list = [str(entry_id) for entry_id in ids]
+            count = self._streams.xack(key, group, id_list)
+            if count > 0:
+                payload = {"group": group, "ids": id_list}
+                lsn = 0
+                if not skip_wal:
+                    lsn = self._wal.log("stream_xack", key, payload)
+                if not skip_replication:
+                    self._replication.enqueue_change("stream_xack", key, payload, lsn=lsn)
+            return count
+
+    def stream_xpending(self, key: Any, group: str) -> Dict[str, Any]:
+        return self._streams.xpending(key, group)
+
+    def stream_delete(
+        self,
+        key: Any,
+        *,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> bool:
+        with self._write_lock:
+            deleted = self._streams.delete(key)
+            if deleted:
+                lsn = 0
+                if not skip_wal:
+                    lsn = self._wal.log("stream_delete", key)
+                if not skip_replication:
+                    self._replication.enqueue_change("stream_delete", key, lsn=lsn)
+            return deleted
+
+    def stream_stats(self) -> Dict[str, Any]:
+        return self._streams.stats()
+
     def scan(
         self,
         prefix: Optional[str] = None,
@@ -757,6 +911,7 @@ class ShardedKeyValueStore(object):
         with self._write_lock:
             data = {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
             data["_vectors"] = self._vector_index.dump()
+            data["_streams"] = self._streams.dump()
             return data
 
     def dump_with_lsn(self) -> tuple[int, Dict[str, Dict[str, Any]]]:
@@ -764,10 +919,12 @@ class ShardedKeyValueStore(object):
             lsn = int(getattr(self._wal, "_lsn", 0) or 0)
             data = {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
             data["_vectors"] = self._vector_index.dump()
+            data["_streams"] = self._streams.dump()
             return lsn, data
 
     def load(self, data: Dict[str, Dict[str, Any]]) -> None:
         vectors = data.get("_vectors") if isinstance(data, dict) else None
+        streams = data.get("_streams") if isinstance(data, dict) else None
         for idx_str, shard_data in data.items():
             try:
                 idx = int(idx_str)
@@ -781,6 +938,7 @@ class ShardedKeyValueStore(object):
                 self._vector_index.load(vectors)
             except Exception:
                 self._vector_index.clear()
+        self._streams.load(streams if isinstance(streams, dict) else {})
 
     def reshard(self, new_shards: int) -> dict:
         """

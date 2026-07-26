@@ -277,6 +277,53 @@ def recover_from_wal(store, wal: WAL):
                         store.vector_upsert(key, val, skip_wal=True, skip_replication=True)
                     elif op == "vector_delete":
                         store.vector_delete(key, skip_wal=True, skip_replication=True)
+                    elif op == "stream_xadd":
+                        payload = val if isinstance(val, dict) else {}
+                        store.stream_xadd(
+                            key,
+                            payload.get("fields", {}),
+                            entry_id=str(payload.get("id", "*")),
+                            maxlen=payload.get("maxlen"),
+                            skip_wal=True,
+                            skip_replication=True,
+                        )
+                    elif op == "stream_xgroup_create":
+                        payload = val if isinstance(val, dict) else {}
+                        try:
+                            store.stream_xgroup_create(
+                                key,
+                                str(payload.get("group", "")),
+                                entry_id=str(payload.get("id", "$")),
+                                mkstream=bool(payload.get("mkstream", False)),
+                                skip_wal=True,
+                                skip_replication=True,
+                            )
+                        except KeyError:
+                            pass
+                    elif op == "stream_xack":
+                        payload = val if isinstance(val, dict) else {}
+                        store.stream_xack(
+                            key,
+                            str(payload.get("group", "")),
+                            payload.get("ids", []) or [],
+                            skip_wal=True,
+                            skip_replication=True,
+                        )
+                    elif op == "stream_xdeliver":
+                        payload = val if isinstance(val, dict) else {}
+                        try:
+                            store.stream_xdeliver(
+                                key,
+                                str(payload.get("group", "")),
+                                str(payload.get("consumer", "")),
+                                payload.get("ids", []) or [],
+                                skip_wal=True,
+                                skip_replication=True,
+                            )
+                        except KeyError:
+                            pass
+                    elif op == "stream_delete":
+                        store.stream_delete(key, skip_wal=True, skip_replication=True)
                 except Exception as e:
                     logging.warning("Failed to recover entry: %s", e)
         wal._lsn = max_lsn

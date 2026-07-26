@@ -752,11 +752,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         lsn, data = STORE.dump_with_lsn()
         _write_line({"_lsn": int(lsn), "shards": settings.SHARDS})
         vector_state = data.get("_vectors")
+        stream_state = data.get("_streams")
         shard_items = [(k, v) for k, v in data.items() if str(k).isdigit()]
         for idx_str, shard_state in sorted(shard_items, key=lambda kv: int(kv[0])):
             _write_line({"shard": int(idx_str), "state": shard_state})
         if isinstance(vector_state, dict):
             _write_line({"vectors": vector_state})
+        if isinstance(stream_state, dict):
+            _write_line({"streams": stream_state})
 
         try:
             if compress:
@@ -948,6 +951,45 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._json(200, {"key": key, "vector": vector}, headers=self._with_namespace_headers({}, namespace))
                 self._inc_metrics("GET", route="GET /vector/:key")
                 return
+
+            if parts[0] == "streams":
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("GET", route="GET /streams", error=True)
+                    return
+                if not self._require_role(ROLE_READER, namespace=namespace):
+                    return
+                if len(parts) == 2 and parts[1] == "stats":
+                    if not self._rate_limit("GET /streams/stats", namespace=namespace):
+                        return
+                    self._json(200, STORE.stream_stats(), headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("GET", route="GET /streams/stats")
+                    return
+                if len(parts) == 3 and parts[2] == "range":
+                    if not self._rate_limit("GET /streams/:key/range", namespace=namespace):
+                        return
+                    start = query.get("start", ["-"])[0]
+                    end = query.get("end", ["+"])[0]
+                    count = None
+                    if "count" in query:
+                        try:
+                            count = int(query["count"][0])
+                        except ValueError:
+                            self._send(400, "count must be int")
+                            self._inc_metrics("GET", route="GET /streams/:key/range", error=True)
+                            return
+                    entries = STORE.stream_xrange(self._ns_key(namespace, parts[1]), start=start, end=end, count=count)
+                    self._json(200, {"stream": parts[1], "entries": entries}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("GET", route="GET /streams/:key/range")
+                    return
+                if len(parts) == 5 and parts[2] == "groups" and parts[4] == "pending":
+                    if not self._rate_limit("GET /streams/:key/groups/:group/pending", namespace=namespace):
+                        return
+                    summary = STORE.stream_xpending(self._ns_key(namespace, parts[1]), parts[3])
+                    self._json(200, summary, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("GET", route="GET /streams/:key/groups/:group/pending")
+                    return
+                raise ValueError
 
             if parts[0] == "ai":
                 namespace = self._namespace_or_400(query)
@@ -1222,6 +1264,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     raise KeyError(parts[1])
                 self._send(204, headers=self._with_namespace_headers({}, namespace))
                 self._inc_metrics("DELETE", route="DELETE /vector/:key")
+                return
+            if len(parts) == 2 and parts[0] == "streams" and parts[1] != "":
+                deleted = STORE.stream_delete(self._ns_key(namespace, parts[1]))
+                if not deleted:
+                    raise KeyError(parts[1])
+                self._send(204, headers=self._with_namespace_headers({}, namespace))
+                self._inc_metrics("DELETE", route="DELETE /streams/:key")
                 return
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
@@ -1560,6 +1609,133 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         headers=self._with_namespace_headers({}, namespace),
                     )
                     self._inc_metrics("POST", route="POST /vector/upsert")
+                    return
+
+            if len(parts) >= 1 and parts[0] == "streams":
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("POST", route="POST /streams", error=True)
+                    return
+                if parts == ["streams", "read"]:
+                    if not self._rate_limit("POST /streams/read", namespace=namespace):
+                        return
+                    if not self._require_role(ROLE_READER, namespace=namespace):
+                        return
+                    payload = json.loads(self._body() or b"{}")
+                    raw_streams = payload.get("streams", {})
+                    if not isinstance(raw_streams, dict):
+                        self._send(400, "streams must be object")
+                        self._inc_metrics("POST", route="POST /streams/read", error=True)
+                        return
+                    count = payload.get("count")
+                    block_ms = int(payload.get("block_ms", 0) or 0)
+                    scoped_streams = {self._ns_key(namespace, k): str(v) for k, v in raw_streams.items()}
+                    result = STORE.stream_xread(scoped_streams, count=None if count is None else int(count), block_ms=block_ms)
+                    out = {
+                        str(self._ns_strip(namespace, key)): entries
+                        for key, entries in result.items()
+                    }
+                    self._json(200, {"streams": out}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /streams/read")
+                    return
+                if not self._require_role(ROLE_WRITER, namespace=namespace):
+                    return
+                if settings.REPLICATION_ROLE == "follower":
+                    self._reject_readonly(route="POST /streams")
+                    return
+                if not self._enforce_disk_write_budget("POST /streams"):
+                    return
+                payload = json.loads(self._body() or b"{}")
+
+                if len(parts) == 2 and parts[1]:
+                    if not self._rate_limit("POST /streams/:key", namespace=namespace):
+                        return
+                    fields = payload.get("fields", {})
+                    entry_id = str(payload.get("id", "*"))
+                    maxlen = payload.get("maxlen")
+                    if not isinstance(fields, dict) or not fields:
+                        self._send(400, "fields must be non-empty object")
+                        self._inc_metrics("POST", route="POST /streams/:key", error=True)
+                        return
+                    try:
+                        new_id = STORE.stream_xadd(
+                            self._ns_key(namespace, parts[1]),
+                            fields,
+                            entry_id=entry_id,
+                            maxlen=None if maxlen is None else int(maxlen),
+                        )
+                    except ValueError as e:
+                        self._send(400, str(e))
+                        self._inc_metrics("POST", route="POST /streams/:key", error=True)
+                        return
+                    self._json(201, {"stream": parts[1], "id": new_id}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /streams/:key")
+                    return
+
+                if len(parts) == 3 and parts[2] == "groups":
+                    if not self._rate_limit("POST /streams/:key/groups", namespace=namespace):
+                        return
+                    group = str(payload.get("group", ""))
+                    entry_id = str(payload.get("id", "$"))
+                    mkstream = bool(payload.get("mkstream", False))
+                    try:
+                        STORE.stream_xgroup_create(
+                            self._ns_key(namespace, parts[1]),
+                            group,
+                            entry_id=entry_id,
+                            mkstream=mkstream,
+                        )
+                    except KeyError as e:
+                        self._send(404, str(e))
+                        self._inc_metrics("POST", route="POST /streams/:key/groups", error=True)
+                        return
+                    except ValueError as e:
+                        self._send(400, str(e))
+                        self._inc_metrics("POST", route="POST /streams/:key/groups", error=True)
+                        return
+                    self._json(201, {"stream": parts[1], "group": group}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /streams/:key/groups")
+                    return
+
+                if len(parts) == 5 and parts[2] == "groups" and parts[4] == "read":
+                    if not self._rate_limit("POST /streams/:key/groups/:group/read", namespace=namespace):
+                        return
+                    consumer = str(payload.get("consumer", ""))
+                    entry_id = str(payload.get("id", ">"))
+                    count = payload.get("count")
+                    block_ms = int(payload.get("block_ms", 0) or 0)
+                    if not consumer:
+                        self._send(400, "consumer must be non-empty")
+                        self._inc_metrics("POST", route="POST /streams/:key/groups/:group/read", error=True)
+                        return
+                    try:
+                        entries = STORE.stream_xreadgroup(
+                            self._ns_key(namespace, parts[1]),
+                            parts[3],
+                            consumer,
+                            entry_id=entry_id,
+                            count=None if count is None else int(count),
+                            block_ms=block_ms,
+                        )
+                    except KeyError as e:
+                        self._send(404, str(e))
+                        self._inc_metrics("POST", route="POST /streams/:key/groups/:group/read", error=True)
+                        return
+                    self._json(200, {"stream": parts[1], "group": parts[3], "entries": entries}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /streams/:key/groups/:group/read")
+                    return
+
+                if len(parts) == 5 and parts[2] == "groups" and parts[4] == "ack":
+                    if not self._rate_limit("POST /streams/:key/groups/:group/ack", namespace=namespace):
+                        return
+                    ids = payload.get("ids", [])
+                    if not isinstance(ids, list):
+                        self._send(400, "ids must be array")
+                        self._inc_metrics("POST", route="POST /streams/:key/groups/:group/ack", error=True)
+                        return
+                    count = STORE.stream_xack(self._ns_key(namespace, parts[1]), parts[3], [str(entry_id) for entry_id in ids])
+                    self._json(200, {"acked": count}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /streams/:key/groups/:group/ack")
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":

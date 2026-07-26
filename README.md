@@ -100,7 +100,7 @@ You can connect to PX-KVStore using any standard Redis client:
 redis-cli -p 6379 SET mykey "Hello Redis"
 redis-cli -p 6379 GET mykey
 ```
-Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`.
+Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`, `XADD`, `XRANGE`, `XREAD`, `XGROUP CREATE`, `XREADGROUP`, `XACK`, `XPENDING`.
 
 ### **Top-K Heavy Hitters**
 Enable bounded-memory hot-key tracking for high-cardinality read workloads:
@@ -181,7 +181,7 @@ The cache is bounded and stores parsed command/scan metadata, not values or quer
 - [x] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
 - [ ] **Vector Indexing**: Native support for vector similarity search (HNSW) for embedding workloads.
 - [ ] **Snapshot Diff / Incremental Backup**: Ship only changed pages between snapshots to cut backup cost.
-- [ ] **Redis Streams Compatibility**: Support XADD/XREAD/XGROUP-style event streams for log-like workloads.
+- [x] **Redis Streams Compatibility**: Support XADD/XREAD/XGROUP-style event streams for log-like workloads.
 - [ ] **Lua / Server-Side Scripting**: Add atomic script execution for multi-key workflows.
 - [ ] **Online Backup Restore Preview**: Validate backup archives and estimate restore impact before applying.
 - [ ] **Shard Rebalancing Progress API**: Expose live migration progress, throttling, and cancellation controls.
